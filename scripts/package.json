@@ -4,6 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/swap-loop.js",
+    "dev": "tsx src/swap-loop.ts",
     "contract:buy": "tsx src/contract-order.ts buy",
     "contract:sell": "tsx src/contract-order.ts sell",
     "http:buy": "tsx src/http-order.ts buy",

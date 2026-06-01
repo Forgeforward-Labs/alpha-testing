@@ -3,8 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "build": "pnpm --filter @trading/sdk run build",
-    "start": "pnpm --filter @trading/scripts run swap:loop",
+    "build": "turbo build",
+    "start": "pnpm --filter @trading/scripts run start",
     "dev": "turbo dev --filter=@trading/grid-bot",
     "dev:all": "turbo dev",
     "type-check": "turbo type-check"

@@ -177,19 +177,22 @@ async function main(): Promise<void> {
     // bot running with smaller clips rather than skipping cycles entirely.
     const effectiveQuote = Math.min(SWAP_AMOUNT_QUOTE, quoteBalance);
 
-    console.log(
-      `[swap] Balances: base=${baseBalance.toFixed(4)} (tradable=${tradableBase.toFixed(4)}) quote=${quoteBalance.toFixed(4)}` +
-        (effectiveQuote < SWAP_AMOUNT_QUOTE ? ` [using ${effectiveQuote.toFixed(4)} quote this cycle]` : ''),
-    );
-
-    // canBuy: any quote at all — placeSide will reject below min quantity.
-    const canBuy = quoteBalance > 0;
-    const canSell = tradableBase >= Number(market.minQuantity);
-
-    // Fetch book — reused for initial leg pricing.
+    // Fetch book first so canBuy uses the live ask to check affordability precisely.
     const book = await http.getOrderBook(market.symbol, 3);
     let bestBid = book?.bids[0]?.price;
     let bestAsk = book?.asks[0]?.price;
+
+    const minQty = Number(market.minQuantity);
+    // canBuy: quote must cover at least one minimum-sized buy at the live ask.
+    // Using quoteBalance > 0 is too lenient — dust balances pass but the order fails.
+    const canBuy = bestAsk ? effectiveQuote / Number(bestAsk) >= minQty : false;
+    const canSell = tradableBase >= minQty;
+
+    console.log(
+      `[swap] Balances: base=${baseBalance.toFixed(4)} (tradable=${tradableBase.toFixed(4)}) quote=${quoteBalance.toFixed(4)}` +
+        (effectiveQuote < SWAP_AMOUNT_QUOTE ? ` [using ${effectiveQuote.toFixed(4)} quote this cycle]` : '') +
+        ` | canBuy=${canBuy} canSell=${canSell}`,
+    );
 
     if (!canBuy && !canSell) {
       console.log('[swap] Insufficient balance on both sides — skipping cycle');
@@ -202,7 +205,7 @@ async function main(): Promise<void> {
       const sellAmount = alignToStep(targetBase.toString(), market.lotSize);
 
       console.log(
-        `[swap] No quote with base available — selling first to recover quote`,
+        `[swap] Quote too low to buy (${quoteBalance.toFixed(4)}) — selling base first to recover quote`,
       );
 
       const soldAmount = await placeSide('sell', market, bestBid, bestAsk, executor, signer, sellAmount);

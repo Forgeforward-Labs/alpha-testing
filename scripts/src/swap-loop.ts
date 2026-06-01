@@ -1,0 +1,243 @@
+import 'dotenv/config';
+import { Wallet, parseUnits, formatUnits } from 'ethers';
+import { config } from './config.js';
+import { DreamDexHttpClient } from '@trading/sdk';
+import type { MarketInfo, PrepareOrderRequest, Side } from '@trading/sdk';
+import { HttpOrderExecutor } from '@trading/sdk';
+import { TransactionExecutor } from '@trading/sdk';
+import { adjustPriceByBps, alignToStep } from '@trading/sdk';
+
+const SWAP_AMOUNT_QUOTE = Number(process.env.DREAMDEX_SWAP_AMOUNT_QUOTE ?? '10');
+const SLIPPAGE_BPS = Number(process.env.DREAMDEX_SWAP_SLIPPAGE_BPS ?? '5');
+const CYCLE_MS = Number(process.env.DREAMDEX_SWAP_CYCLE_MS ?? '15000');
+const GAS_RESERVE = Number(process.env.DREAMDEX_GAS_RESERVE ?? '0.02');
+
+let running = true;
+process.on('SIGINT', () => {
+  console.log('\n[swap] Stopping after current cycle...');
+  running = false;
+});
+process.on('SIGTERM', () => {
+  running = false;
+});
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Returns the base amount placed, or undefined if the order was skipped.
+async function placeSide(
+  side: Side,
+  market: MarketInfo,
+  bestBid: string | undefined,
+  bestAsk: string | undefined,
+  executor: HttpOrderExecutor,
+  signer: TransactionExecutor,
+  fixedBaseAmount?: string,
+  effectiveQuoteAmount?: number,
+): Promise<string | undefined> {
+  const reference = side === 'buy' ? bestAsk : bestBid;
+  if (!reference) {
+    console.log(
+      `[swap] No ${side === 'buy' ? 'ask' : 'bid'} in book — skipping ${side}`,
+    );
+    return undefined;
+  }
+
+  // Buyers cross the ask upward, sellers cross the bid downward.
+  const price = alignToStep(
+    adjustPriceByBps(reference, SLIPPAGE_BPS, side === 'buy' ? 'up' : 'down'),
+    market.tickSize,
+  );
+
+  // For sells: use the exact amount from the preceding buy to avoid balance errors.
+  // For buys: use effectiveQuoteAmount (capped to available balance) so chop-reduced
+  // balances don't cause skipped cycles — the bot just trades a smaller clip.
+  const quoteToUse = effectiveQuoteAmount ?? SWAP_AMOUNT_QUOTE;
+  const baseAmount =
+    fixedBaseAmount ??
+    alignToStep(
+      (quoteToUse / Number(reference)).toString(),
+      market.lotSize,
+    );
+
+  if (Number(baseAmount) < Number(market.minQuantity)) {
+    console.log(
+      `[swap] Computed amount ${baseAmount} is below minimum ${market.minQuantity} — skipping ${side}`,
+    );
+    return undefined;
+  }
+
+  const request: PrepareOrderRequest = {
+    walletAddress: config.walletAddress,
+    type: 'limit',
+    side,
+    amount: baseAmount,
+    price,
+    fundingSource: config.fundingSource,
+    orderType: 'immediateOrCancel',
+    selfMatchingOption: config.selfMatchingOption,
+  };
+
+  console.log(
+    `[swap] ${side.toUpperCase()} ${baseAmount} ${market.symbol} @ ${price}` +
+      ` (book ${side === 'buy' ? 'ask' : 'bid'}=${reference}, slippage=${SLIPPAGE_BPS}bps)`,
+  );
+
+  if (config.dryRun) {
+    console.log('[swap] Dry-run — skipping send');
+    return baseAmount;
+  }
+
+  // Sell orders spend the base token — the API does not return an approval for
+  // this direction, so approve the market contract to pull the base tokens first.
+  if (side === 'sell') {
+    const rawAmount = parseUnits(baseAmount, market.baseDecimals);
+    const approvalHash = await signer.ensureErc20Allowance(
+      market.base,
+      market.contract,
+      rawAmount,
+    );
+    if (approvalHash) {
+      console.log(`[swap] Base token approval tx: ${approvalHash}`);
+    }
+  }
+
+  try {
+    const result = await executor.executeOrder(market, request);
+    if (result.approvalTxHash) {
+      console.log(`[swap] Approval tx: ${result.approvalTxHash}`);
+    }
+    console.log(`[swap] ${side.toUpperCase()} tx: ${result.txHash}`);
+    return baseAmount;
+  } catch (error) {
+    console.error(
+      `[swap] ${side.toUpperCase()} failed:`,
+      error instanceof Error ? error.message : error,
+    );
+    return undefined;
+  }
+}
+
+async function main(): Promise<void> {
+  const wallet = new Wallet(config.privateKey);
+  const http = new DreamDexHttpClient(
+    config.baseUrl,
+    wallet,
+    config.chainId,
+    config.siweDomain,
+    config.siweUri,
+  );
+  const signer = new TransactionExecutor(
+    config.rpcUrl,
+    config.privateKey,
+    config.chainId,
+  );
+  const executor = new HttpOrderExecutor(http, signer);
+
+  await signer.assertConnectedChain();
+
+  const markets = await http.listMarkets();
+  const market = markets.find((m) => m.symbol === config.symbol);
+  if (!market) {
+    throw new Error(`Market not found: ${config.symbol}`);
+  }
+
+  const isNativeSomi = market.symbol.startsWith('SOMI:');
+
+  console.log(`[swap] Symbol      : ${market.symbol}`);
+  console.log(
+    `[swap] Tick/Lot    : ${market.tickSize} / ${market.lotSize} (min qty ${market.minQuantity})`,
+  );
+  console.log(`[swap] Amount      : ${SWAP_AMOUNT_QUOTE} quote per side`);
+  console.log(`[swap] Slippage    : ${SLIPPAGE_BPS} bps`);
+  console.log(`[swap] Cycle       : ${CYCLE_MS / 1000}s`);
+  console.log(`[swap] Dry-run     : ${config.dryRun}`);
+  if (isNativeSomi) {
+    console.log(`[swap] Gas reserve : ${GAS_RESERVE} SOMI`);
+  }
+
+  let cycle = 0;
+
+  while (running) {
+    const cycleStart = Date.now();
+    cycle++;
+    console.log(`\n[swap] ─── Cycle ${cycle} ───`);
+
+    // Check live balances to decide which side goes first this cycle.
+    const [baseRaw, quoteRaw] = await Promise.all([
+      isNativeSomi ? signer.getNativeBalance() : signer.getErc20Balance(market.base),
+      signer.getErc20Balance(market.quote),
+    ]);
+    const baseBalance = Number(formatUnits(baseRaw, market.baseDecimals));
+    const quoteBalance = Number(formatUnits(quoteRaw, market.quoteDecimals));
+    const tradableBase = isNativeSomi ? Math.max(0, baseBalance - GAS_RESERVE) : baseBalance;
+
+    // Effective buy size: cap to available quote so chop-reduced balances keep the
+    // bot running with smaller clips rather than skipping cycles entirely.
+    const effectiveQuote = Math.min(SWAP_AMOUNT_QUOTE, quoteBalance);
+
+    console.log(
+      `[swap] Balances: base=${baseBalance.toFixed(4)} (tradable=${tradableBase.toFixed(4)}) quote=${quoteBalance.toFixed(4)}` +
+        (effectiveQuote < SWAP_AMOUNT_QUOTE ? ` [using ${effectiveQuote.toFixed(4)} quote this cycle]` : ''),
+    );
+
+    // canBuy: any quote at all — placeSide will reject below min quantity.
+    const canBuy = quoteBalance > 0;
+    const canSell = tradableBase >= Number(market.minQuantity);
+
+    // Fetch book — reused for initial leg pricing.
+    const book = await http.getOrderBook(market.symbol, 3);
+    let bestBid = book?.bids[0]?.price;
+    let bestAsk = book?.asks[0]?.price;
+
+    if (!canBuy && !canSell) {
+      console.log('[swap] Insufficient balance on both sides — skipping cycle');
+    } else if (!canBuy && canSell) {
+      // Residual base from a failed previous sell — recover quote first.
+      const refPrice = bestBid ? Number(bestBid) : 0;
+      const targetBase = refPrice > 0
+        ? Math.min(tradableBase, SWAP_AMOUNT_QUOTE / refPrice)
+        : tradableBase;
+      const sellAmount = alignToStep(targetBase.toString(), market.lotSize);
+
+      console.log(
+        `[swap] No quote with base available — selling first to recover quote`,
+      );
+
+      const soldAmount = await placeSide('sell', market, bestBid, bestAsk, executor, signer, sellAmount);
+      if (running && soldAmount) {
+        // Re-fetch book for a fresh ask price before buying.
+        const freshBook = await http.getOrderBook(market.symbol, 3);
+        bestBid = freshBook?.bids[0]?.price ?? bestBid;
+        bestAsk = freshBook?.asks[0]?.price ?? bestAsk;
+        await placeSide('buy', market, bestBid, bestAsk, executor, signer, undefined, effectiveQuote);
+      }
+    } else {
+      // Normal path: buy first with effective (possibly reduced) quote amount,
+      // then sell the exact bought amount.
+      const boughtAmount = await placeSide('buy', market, bestBid, bestAsk, executor, signer, undefined, effectiveQuote);
+      if (running && boughtAmount) {
+        // Re-fetch book before sell so the bid price is current after the buy confirms.
+        const freshBook = await http.getOrderBook(market.symbol, 3);
+        bestBid = freshBook?.bids[0]?.price ?? bestBid;
+        bestAsk = freshBook?.asks[0]?.price ?? bestAsk;
+        await placeSide('sell', market, bestBid, bestAsk, executor, signer, boughtAmount);
+      }
+    }
+
+    const elapsed = Date.now() - cycleStart;
+    const wait = Math.max(0, CYCLE_MS - elapsed);
+    if (running && wait > 0) {
+      console.log(`[swap] Next cycle in ${Math.round(wait / 1000)}s`);
+      await sleep(wait);
+    }
+  }
+
+  console.log('[swap] Stopped.');
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});

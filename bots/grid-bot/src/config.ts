@@ -118,6 +118,7 @@ export const config = {
   persistenceDir: optional('DREAMDEX_PERSISTENCE_DIR', './data'),
   autoVault: optional('DREAMDEX_AUTO_VAULT', 'false') === 'true',
   vaultGasReserve: optional('DREAMDEX_VAULT_GAS_RESERVE', '0.02'),
+  metricsPort: Number(optional('METRICS_PORT', '0')),
 } as const;
 
 if (
@@ -141,7 +142,8 @@ if (
   Number.isNaN(config.gridMaxSpreadBps) ||
   Number.isNaN(config.gridMaxLongQuote) ||
   Number.isNaN(config.gridMaxSessionLossQuote) ||
-  Number.isNaN(config.gridStuckTimeoutMs)
+  Number.isNaN(config.gridStuckTimeoutMs) ||
+  Number.isNaN(config.metricsPort)
 ) {
   throw new Error(
     'DreamDEX numeric env vars include invalid numbers. Check thresholds, chain id, expiry, and market-maker settings.',

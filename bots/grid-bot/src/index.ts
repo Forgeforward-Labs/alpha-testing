@@ -1,5 +1,6 @@
 import { Wallet, formatUnits } from 'ethers';
 import { config } from './config.js';
+import { MetricsServer } from './metrics-server.js';
 import { DreamDexHttpClient } from '@trading/sdk';
 import { DreamDexWsClient } from '@trading/sdk';
 import { ContractOrderExecutor } from '@trading/sdk';
@@ -174,12 +175,25 @@ async function main(): Promise<void> {
   const liveInventory = await getLiveInventory(executor, market);
   strategy.syncInventory?.(liveInventory);
 
+  const metrics =
+    config.metricsPort > 0 ? new MetricsServer(config.metricsPort) : undefined;
+  metrics?.start();
+  metrics?.update({
+    symbol: market.symbol,
+    strategy: config.strategy,
+    executionMode: config.executionMode,
+    baseBalance: liveInventory.baseBalance,
+    quoteBalance: liveInventory.quoteBalance,
+  });
+
   const vaultManager = config.autoVault
     ? new VaultManager(executor, market.contract)
     : undefined;
 
   if (vaultManager) {
-    console.log('[vault] Auto-vault enabled: depositing wallet funds to vault...');
+    console.log(
+      '[vault] Auto-vault enabled: depositing wallet funds to vault...',
+    );
     await vaultManager.depositAll(market, config.vaultGasReserve);
   }
 
@@ -227,7 +241,10 @@ async function main(): Promise<void> {
       try {
         await vaultManager.withdrawAll(market);
       } catch (error) {
-        console.error('[vault] Failed to withdraw from vault on shutdown:', error);
+        console.error(
+          '[vault] Failed to withdraw from vault on shutdown:',
+          error,
+        );
       }
     }
     process.exit(0);
@@ -273,7 +290,6 @@ async function main(): Promise<void> {
         message,
         config.symbol,
       );
-      console.log('cached: ', cachedOrderBook);
 
       // No snapshot received yet — treat as a completely empty book so the
       // strategy can still post a resting limit based on inventory position.
@@ -295,6 +311,11 @@ async function main(): Promise<void> {
           console.log(
             `[sync] Live balances refreshed: base=${fresh.baseBalance.toFixed(4)} quote=${fresh.quoteBalance.toFixed(4)}`,
           );
+          metrics?.update({ baseBalance: fresh.baseBalance, quoteBalance: fresh.quoteBalance });
+          const bid = Number(effectiveBook.bids[0]?.price ?? 0);
+          const ask = Number(effectiveBook.asks[0]?.price ?? 0);
+          const mid = bid > 0 && ask > 0 ? (bid + ask) / 2 : ask || bid;
+          if (mid > 0) metrics?.pushEquity(fresh.quoteBalance + fresh.baseBalance * mid);
         } catch (error) {
           console.warn('[sync] Failed to refresh live inventory:', error);
         }
@@ -338,7 +359,9 @@ async function main(): Promise<void> {
 
       lastActionAt = now;
 
-      const effectiveFundingSource = config.autoVault ? 'vault' : config.fundingSource;
+      const effectiveFundingSource = config.autoVault
+        ? 'vault'
+        : config.fundingSource;
       const request = toPrepareOrderRequest(
         config.walletAddress,
         signal,
@@ -353,7 +376,8 @@ async function main(): Promise<void> {
       // With wallet funding the API only accepts immediateOrCancel or fillOrKill.
       if (
         effectiveFundingSource === 'wallet' &&
-        (effectiveOrderType === 'normalOrder' || effectiveOrderType === 'postOnly')
+        (effectiveOrderType === 'normalOrder' ||
+          effectiveOrderType === 'postOnly')
       ) {
         console.warn(
           `[warn] Skipping ${effectiveOrderType} order — resting orders require DREAMDEX_FUNDING_SOURCE=vault`,
@@ -407,9 +431,22 @@ async function main(): Promise<void> {
           strategyState: strategy.getPersistentState?.(),
         });
 
+        const notional = Number(execution.filledAmount) * Number(execution.executionPrice);
+        if (notional > 0) {
+          metrics?.pushTrade({
+            at: Date.now(),
+            side: signal.side,
+            price: execution.executionPrice,
+            amount: signal.amount,
+            filledAmount: execution.filledAmount,
+            notional,
+          });
+        }
+
         const statusLine = strategy.getStatusLine?.();
         if (statusLine) {
           console.log(`[strategy] ${statusLine}`);
+          metrics?.update({ statusLine });
         }
       } catch (error) {
         console.error('[exec] Failed to prepare or send order:', error);
@@ -512,8 +549,12 @@ async function getLiveInventory(
   ]);
 
   return {
-    baseBalance: Number(formatUnits(baseRaw + vaultBaseRaw, market.baseDecimals)),
-    quoteBalance: Number(formatUnits(quoteRaw + vaultQuoteRaw, market.quoteDecimals)),
+    baseBalance: Number(
+      formatUnits(baseRaw + vaultBaseRaw, market.baseDecimals),
+    ),
+    quoteBalance: Number(
+      formatUnits(quoteRaw + vaultQuoteRaw, market.quoteDecimals),
+    ),
   };
 }
 

@@ -83,17 +83,17 @@ export default function Dashboard() {
           />
           <StatCard
             label="Volume"
-            value={`$${state.totalVolume.toFixed(2)}`}
-            sub={`${state.totalTrades} trades`}
+            value={`$${(state.totalVolume ?? 0).toFixed(2)}`}
+            sub={`${state.totalTrades ?? 0} trades`}
           />
           <StatCard
             label={base}
-            value={state.baseBalance.toFixed(4)}
+            value={(state.baseBalance ?? 0).toFixed(4)}
             sub="base balance"
           />
           <StatCard
             label={quote}
-            value={state.quoteBalance.toFixed(2)}
+            value={(state.quoteBalance ?? 0).toFixed(2)}
             sub="quote balance"
           />
         </div>
@@ -111,7 +111,7 @@ export default function Dashboard() {
               Equity Curve
             </p>
             <div className="h-56">
-              <EquityChart data={state.equitySeries} />
+              <EquityChart data={state.equitySeries ?? []} />
             </div>
           </div>
 
@@ -119,7 +119,7 @@ export default function Dashboard() {
             <p className="mb-3 text-xs font-medium text-muted uppercase tracking-wider">
               Recent Trades
             </p>
-            <TradeTable trades={state.recentTrades.slice(0, 15)} />
+            <TradeTable trades={(state.recentTrades ?? []).slice(0, 15)} />
           </div>
         </div>
       )}

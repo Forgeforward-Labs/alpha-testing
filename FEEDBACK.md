@@ -1,6 +1,6 @@
 # DreamDEX Developer Feedback
 
-Feedback from building a production-grade trading bot on DreamDEX (Somnia Shannon testnet) during the Alpha Trading Competition. Written from the perspective of a developer integrating against the API from scratch.
+Feedback from building a production-grade trading bot on DreamDEX (Somnia mainnet) during the Alpha Trading Competition. Written from the perspective of a developer integrating against the API from scratch.
 
 ---
 
@@ -29,11 +29,11 @@ The issues below are integration-level friction points, not fundamental problems
 
 ### 2. Setting `expiresAt = 0` returns an error
 
-**What happened:** The contract's `placeOrder` function accepts an `expiresAt` parameter. Setting it to `0` (intending "no expiry") caused the transaction to revert on both testnet and mainnet. The behaviour is consistent across environments — `0` is simply not accepted as a valid expiry value.
+**What happened:** The contract's `placeOrder` function accepts an `expiresAt` parameter. Setting it to `0` (intending "no expiry") caused the transaction to revert on Somnia mainnet. Initial testing on testnet confirmed the same behaviour — `0` is simply not accepted as a valid expiry value in either environment.
 
 **Workaround implemented:** The bot substitutes a 1-hour expiry (`Math.floor(Date.now() / 1000) + 3600`) whenever `DREAMDEX_EXPIRE_SECONDS=0` is configured.
 
-**Impact:** This is not documented anywhere in the current API or contract reference. Developers on both testnet and mainnet will hit this with no indication of why their transaction reverted. The RPC error message is generic and gives no hint that the expiry parameter is the cause.
+**Impact:** This is not documented anywhere in the current API or contract reference. Developers on mainnet will hit this with no indication of why their transaction reverted. The RPC error message is generic and gives no hint that the expiry parameter is the cause.
 
 **Suggestion:**
 - Document the minimum valid `expiresAt` value (or that `0` is not a valid no-expiry sentinel)
@@ -44,9 +44,9 @@ The issues below are integration-level friction points, not fundamental problems
 
 ### 3. Docs inconsistency between staging and mainnet examples
 
-**What happened:** Quick-start examples in some docs sections use the mainnet API host (`api.dreamdex.io`) while the testnet/Shannon section references `stg.api.dreamdex.io`. Copy-pasting examples into a testnet project silently sent requests to mainnet.
+**What happened:** Quick-start examples in some docs sections reference `stg.api.dreamdex.io` (staging) while the mainnet section uses `api.dreamdex.io`. Without a clear environment selector, it is easy to accidentally target the wrong environment — staging requests appear to succeed but produce no real on-chain activity.
 
-**Suggestion:** Add a clear environment selector or banner to the docs. Prefix all code examples with the relevant environment variable block.
+**Suggestion:** Add a clear environment selector or banner to the docs. Prefix all code examples with the relevant environment variable block so developers know exactly which environment they are targeting.
 
 ---
 
@@ -76,7 +76,7 @@ The issues below are integration-level friction points, not fundamental problems
 | High | Add a contract integration guide: funding source → order type → function mapping |
 | Medium | Surface a fallback reference price in the market API for empty-book conditions |
 | Medium | Fix docs environment inconsistency (staging vs mainnet examples) |
-| Low | Add a minimum book depth SLA or disclosure for testnet |
+| Low | Add a minimum book depth SLA or disclosure for competition windows |
 
 ---
 

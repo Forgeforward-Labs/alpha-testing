@@ -28,11 +28,13 @@ function StatCard({ label, value, sub, color }: { label: string; value: string; 
 export default function Dashboard() {
   const { state, connected } = useBotState();
 
-  const base = state?.symbol.split(':')[0] ?? 'BASE';
-  const quote = state?.symbol.split(':')[1] ?? 'QUOTE';
+  const parts = (state?.symbol ?? '').split(':');
+  const base = parts[0] ?? 'BASE';
+  const quote = parts[1] ?? 'QUOTE';
 
-  const initialEquity = state?.equitySeries[0]?.value ?? 0;
-  const currentEquity = state?.equitySeries[state.equitySeries.length - 1]?.value ?? 0;
+  const series = state?.equitySeries ?? [];
+  const initialEquity = series[0]?.value ?? 0;
+  const currentEquity = series.at(-1)?.value ?? 0;
   const pnl = currentEquity - initialEquity;
   const pnlPct = initialEquity > 0 ? (pnl / initialEquity) * 100 : 0;
   const pnlColor = pnl >= 0 ? 'text-accent' : 'text-red-400';

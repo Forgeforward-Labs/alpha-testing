@@ -1,279 +1,293 @@
-# DreamDEX Trading Bot Starter
+# Sominia Trading
 
-A TypeScript starter bot for DreamDEX's on-chain CLOB on Somnia.
+A production-grade TypeScript trading system built on [DreamDEX](https://dreamdex.io) — Somnia's on-chain CLOB. Built as a submission for the **DreamDEX Alpha Trading Competition** and as a demo of what a full trading stack on Somnia looks like.
 
-It implements the documented DreamDEX flow:
-- discovers market metadata from `GET /v0/markets`
-- authenticates with SIWE via `GET /v0/auth/nonce` and `POST /v0/auth/login`
-- subscribes to the configured public WebSocket feed
-- supports two execution modes:
-  - `http`: prepares orders via `POST /v0/markets/{symbol}/orders`
-  - `contract`: calls the SpotPool directly with `placeTakerOrderWithoutVault(...)` or `placeOrder(...)`
-- signs and broadcasts transactions to Somnia
-- automatically sends an approval transaction first when needed
+---
 
-## Strategies Included
+## What's inside
 
-### Threshold
+```
+sominia-trading/
+├── packages/
+│   └── sdk/              @trading/sdk — shared DreamDEX clients, executors, vault, persistence
+├── bots/
+│   └── grid-bot/         @trading/grid-bot — multi-strategy trading bot
+├── apps/
+│   └── dashboard/        @trading/dashboard — real-time Next.js monitoring dashboard
+└── scripts/              @trading/scripts — swap loop + one-shot order tools
+```
 
-The original starter strategy is intentionally simple:
-- buy with IOC when best ask is less than or equal to `DREAMDEX_BUY_BELOW_PRICE`
-- sell with IOC when best bid is greater than or equal to `DREAMDEX_SELL_ABOVE_PRICE`
-- optionally restrict signals to `buy`, `sell`, or `both` with `DREAMDEX_ALLOWED_SIDE`
+Built as a **Turbo monorepo** with pnpm workspaces. The SDK is compiled once; all consumers resolve it via pnpm symlinks.
 
-### Micro Market Maker
+---
 
-There is now a second strategy mode for a small wallet:
-- set `DREAMDEX_STRATEGY=marketMaker`
-- keeps an internal estimate of base and quote inventory
-- maintains a moving anchor price from the live mid-price
-- buys only when the ask is cheap relative to the anchor
-- sells only when the bid is rich relative to the anchor
-- skews the buy/sell aggressiveness based on inventory so it gradually rebuilds the side it is short on
-- stops trading if the estimated mark-to-market drawdown exceeds `DREAMDEX_MM_MAX_SESSION_LOSS_QUOTE`
-- prints inventory, equity, and estimated traded volume after reconciled fills
-- does not require `DREAMDEX_BUY_BELOW_PRICE` or `DREAMDEX_SELL_ABOVE_PRICE`
+## Architecture
 
-### Grid
+```
+  DreamDEX API / Somnia Chain
+         │  WebSocket + HTTP + Contract calls
+         │
+  ┌──────▼──────────────────────────┐
+  │         @trading/sdk            │
+  │  DreamDexHttpClient             │
+  │  DreamDexWsClient               │
+  │  ContractOrderExecutor          │
+  │  HttpOrderExecutor              │
+  │  TransactionExecutor            │
+  │  VaultManager                   │
+  │  BotStateStore                  │
+  └──────┬──────────────────────────┘
+         │
+  ┌──────▼──────────────┐    ┌──────────────────────┐
+  │   @trading/grid-bot │    │  @trading/scripts    │
+  │  Grid strategy      │    │  Swap loop           │
+  │  Market-maker       │    │  One-shot orders     │
+  │  Minute-rebalance   │    │  State viewer        │
+  │  Threshold          │    └──────────────────────┘
+  │  MetricsServer ─────┼──► SSE on METRICS_PORT
+  └─────────────────────┘         │
+                            ┌─────▼──────────────────┐
+                            │  @trading/dashboard    │
+                            │  Next.js + Recharts    │
+                            │  Real-time P&L / trades│
+                            └────────────────────────┘
+```
 
-There is also a grid-style mode:
-- set `DREAMDEX_STRATEGY=grid`
-- seeds inventory from live wallet balances while reserving startup SOMI for gas
-- bootstraps the first tradable SOMI buy from USDso
-- buys when ask falls one grid step below the latest reference price
-- sells when bid rises one grid step above the latest reference price
-- updates the reference price after each real fill
-- caps total tradable SOMI inventory with `DREAMDEX_GRID_MAX_LONG_QUOTE`
+---
 
-This is still a starter, not a guaranteed profitable system. The market-maker mode is best thought of as an inventory-aware spread-capture bot, not a fully featured maker engine with resting-order cancel/replace logic yet.
-
-## Setup
-
-1. Install dependencies:
+## Quick start
 
 ```bash
-npm install
+# 1. Install
+pnpm install
+
+# 2. Build SDK (required before running bots)
+pnpm build
+
+# 3. Configure
+cp .env.example bots/grid-bot/.env
+# Edit bots/grid-bot/.env — set DREAMDEX_PRIVATE_KEY, DREAMDEX_RPC_URL, DREAMDEX_DRY_RUN=true
+
+# 4. Run bot (dry-run by default)
+pnpm --filter @trading/grid-bot run dev
+
+# 5. When logs look right, set DREAMDEX_DRY_RUN=false
 ```
 
-2. Copy env file and configure it:
+---
+
+## Packages
+
+### `@trading/sdk`
+
+Shared library consumed by all other packages. No runtime dependencies beyond `ethers` and `ws`.
+
+| Module | Purpose |
+|---|---|
+| `DreamDexHttpClient` | SIWE auth, market discovery, order prep, order fetch |
+| `DreamDexWsClient` | Public order book WebSocket feed |
+| `ContractOrderExecutor` | Calls SpotPool directly (`placeOrder` / `placeTakerOrderWithoutVault`) |
+| `HttpOrderExecutor` | HTTP-prepared unsigned tx → sign → broadcast |
+| `TransactionExecutor` | Wallet, RPC, ERC-20 allowance, balance reads |
+| `VaultManager` | `deposit` / `depositNative` / `withdraw` / `getWithdrawableBalance` |
+| `BotStateStore` | JSON snapshot + JSONL execution journal |
+
+---
+
+### `@trading/grid-bot`
+
+Multi-strategy bot that connects to DreamDEX via WebSocket and trades on every order book update.
+
+#### Strategies
+
+| Strategy | Description |
+|---|---|
+| `grid` | Buys one step below reference price, sells one step above. FIFO lot tracking. Caps max inventory. |
+| `marketMaker` | Inventory-aware spread capture. Skews anchor thresholds toward the short side. |
+| `minuteRebalance` | Keeps base inventory near a target value. Trades when deviation exceeds tolerance. |
+| `threshold` | Simple trigger: buy below price X, sell above price Y. |
+
+#### Auto-vault flow
+
+Set `DREAMDEX_AUTO_VAULT=true` to enable automatic vault management:
+
+1. On startup — deposits wallet balance into the SpotPool vault (keeps `DREAMDEX_VAULT_GAS_RESERVE` SOMI for gas)
+2. During trading — all orders use vault funding, enabling resting limit orders
+3. On shutdown (SIGINT/SIGTERM) — withdraws everything back to wallet
+
+#### Execution modes
+
+| Mode | How it works |
+|---|---|
+| `http` | Private API prepares unsigned tx → bot signs → broadcasts |
+| `contract` | Bot calls SpotPool directly, no private API dependency |
+
+> Wallet-funded contract mode only supports `immediateOrCancel` / `fillOrKill`.
+> Resting orders (`normalOrder`, `postOnly`) require vault funding.
+
+#### Live dashboard
+
+Start the metrics server by setting `METRICS_PORT=3001`, then run the dashboard:
 
 ```bash
-cp .env.example .env
+# Terminal 1
+METRICS_PORT=3001 pnpm --filter @trading/grid-bot run dev
+
+# Terminal 2
+pnpm --filter @trading/dashboard run dev
+# Open http://localhost:3000
 ```
 
-3. Run in dry-run mode first:
+The dashboard shows real-time P&L, equity curve, trade history, and bot status over SSE.
+
+#### Strategy backtester
+
+Simulate any strategy against a generated price series without spending real funds:
 
 ```bash
-npm run dev
+pnpm --filter @trading/grid-bot run backtest
 ```
-
-4. When logs look correct, switch `DREAMDEX_DRY_RUN=false`.
-
-## Persistent State
-
-The bot now persists runtime state so you can stop and restart it without losing the running picture:
-- strategy state is stored in a JSON snapshot under `DREAMDEX_PERSISTENCE_DIR`
-- every execution is appended to a JSONL journal in the same folder
-- for `marketMaker`, the persisted strategy state includes estimated base inventory, quote inventory, anchor price, marked equity, cumulative traded quote volume, and trade count
-
-Default persistence folder:
-
-```env
-DREAMDEX_PERSISTENCE_DIR=./data
-```
-
-Useful command:
 
 ```bash
-npm run state:show
+# Reproducible run (same seed = same price series)
+BT_SEED=42 BT_TICKS=5000 pnpm --filter @trading/grid-bot run backtest
+
+# Higher volatility, smaller capital
+BT_VOLATILITY=0.005 BT_INITIAL_QUOTE=20 pnpm --filter @trading/grid-bot run backtest
 ```
 
-That prints the latest persisted snapshot for the currently configured symbol/strategy pair.
+Output includes: P&L, volume, drawdown, open position, trade count, and an ASCII equity sparkline.
 
-## Small-Wallet Market-Maker Setup
+| Variable | Default | Description |
+|---|---|---|
+| `BT_INITIAL_QUOTE` | `50` | Starting quote balance |
+| `BT_INITIAL_BASE` | `0` | Starting base balance |
+| `BT_START_PRICE` | `0.175` | Simulated start price |
+| `BT_TICKS` | `2000` | Number of price ticks |
+| `BT_SPREAD_BPS` | `10` | Simulated bid-ask spread |
+| `BT_VOLATILITY` | `0.003` | Price volatility per tick |
+| `BT_SEED` | random | RNG seed for reproducible runs |
 
-For a conservative Shannon testnet setup with about `50 USDso`, start with:
+---
 
-```env
-DREAMDEX_SYMBOL=SOMI:USDso
-DREAMDEX_STRATEGY=grid
-DREAMDEX_EXECUTION_MODE=contract
-DREAMDEX_ALLOWED_SIDE=both
-DREAMDEX_FUNDING_SOURCE=wallet
-DREAMDEX_ORDER_TYPE=immediateOrCancel
-DREAMDEX_DRY_RUN=true
+### `@trading/scripts`
 
-DREAMDEX_GRID_TRADE_SIZE_QUOTE=10
-DREAMDEX_GRID_STEP_BPS=15
-DREAMDEX_GRID_MAX_SPREAD_BPS=20
-DREAMDEX_GRID_MAX_LONG_QUOTE=30
-```
-
-Notes:
-- this mode starts quote-heavy and bootstraps tradable SOMI from USDso
-- startup SOMI is reserved for gas and not treated as sellable inventory
-- because it uses IOC wallet flow, every executed trade is still a real taker order
-- after each successful tx, the bot tries to reconcile the order through DreamDEX HTTP so inventory tracking is based on actual fills instead of blind assumptions
-
-## One-Shot Contract Tests
-
-For direct contract testing without running the event loop, use:
+Utility scripts for testing and volume generation.
 
 ```bash
-npm run test:buy
-npm run test:sell
+# Continuous buy/sell swap loop
+pnpm --filter @trading/scripts run dev          # tsx (local dev)
+pnpm --filter @trading/scripts run start        # compiled (production)
+
+# One-shot orders
+pnpm --filter @trading/scripts run contract:buy
+pnpm --filter @trading/scripts run contract:sell
+pnpm --filter @trading/scripts run http:buy
+pnpm --filter @trading/scripts run http:sell
+
+# Show persisted bot state
+pnpm --filter @trading/scripts run state:show
 ```
 
-These scripts:
+#### Swap loop behaviour
 
-- always use the direct SpotPool contract execution path
-- fetch market metadata from the public API
-- read the live order book to choose a default limit price
-- use best ask for `test:buy` if `DREAMDEX_TEST_PRICE` is not set
-- use best bid for `test:sell` if `DREAMDEX_TEST_PRICE` is not set
-- respect `DREAMDEX_DRY_RUN`
+- Checks live balances at the start of every cycle
+- If quote balance is too low to buy (below `minQuantity × bestAsk`), sells base first to recover quote — prevents cascading failures from a failed sell leaving residual base
+- Re-fetches the order book before the second leg so pricing is always fresh
+- Effective buy size caps to available balance (`min(SWAP_AMOUNT_QUOTE, quoteBalance)`) so chop-reduced balances keep the loop running at a smaller clip
 
-Optional env overrides:
+| Variable | Default | Description |
+|---|---|---|
+| `DREAMDEX_SWAP_AMOUNT_QUOTE` | `10` | Target quote amount per side |
+| `DREAMDEX_SWAP_SLIPPAGE_BPS` | `5` | Slippage tolerance |
+| `DREAMDEX_SWAP_CYCLE_MS` | `15000` | Minimum cycle interval |
+| `DREAMDEX_GAS_RESERVE` | `0.02` | Native SOMI kept for gas |
 
-- `DREAMDEX_TEST_SYMBOL`
-- `DREAMDEX_TEST_AMOUNT`
-- `DREAMDEX_TEST_PRICE`
-- `DREAMDEX_TEST_SLIPPAGE_BPS`
-- `DREAMDEX_TEST_AUTO_WITHDRAW`
+---
 
-If `DREAMDEX_TEST_PRICE` is unset, the scripts nudge the live book price to make taker tests more realistic:
+### `@trading/dashboard`
 
-- buy: best ask plus slippage bps
-- sell: best bid minus slippage bps
-
-Default test slippage is `25` bps.
-
-For Shannon testnet native SOMI sells:
-
-- the script now follows the proven pattern from direct contract testing
-- if `DREAMDEX_EXPIRE_SECONDS=0`, contract mode uses a 1-hour expiry on chain `50312`
-- after a successful fill, the script checks `getWithdrawableBalance(...)`
-- by default, it auto-withdraws the received quote token from the pool vault back to your wallet
-
-## One-Shot HTTP Tests
-
-For HTTP-prepared order testing without running the event loop, use:
+Real-time bot monitoring dashboard. Connects to the bot's SSE endpoint.
 
 ```bash
-npm run test:http:buy
-npm run test:http:sell
+pnpm --filter @trading/dashboard run dev    # development
+pnpm --filter @trading/dashboard run build  # production build
+pnpm --filter @trading/dashboard run start  # production server
 ```
 
-These scripts:
+Set `NEXT_PUBLIC_BOT_URL` to point at the bot's metrics server (default: `http://localhost:3001`).
 
-- use DreamDEX private HTTP endpoints to prepare the unsigned transaction
-- sign and broadcast locally with your configured wallet
-- use the same market-data lookup and test-price logic as the contract scripts
-- check the pool vault after execution and auto-withdraw quote token by default
+---
 
-They support the same optional overrides:
+## Configuration reference
 
-- `DREAMDEX_TEST_SYMBOL`
-- `DREAMDEX_TEST_AMOUNT`
-- `DREAMDEX_TEST_PRICE`
-- `DREAMDEX_TEST_SLIPPAGE_BPS`
-- `DREAMDEX_TEST_AUTO_WITHDRAW`
+All configuration is via environment variables. Copy `.env.example` and customise.
 
-## Execution Modes
+### Core
 
-Set `DREAMDEX_EXECUTION_MODE` to one of:
+| Variable | Required | Description |
+|---|---|---|
+| `DREAMDEX_PRIVATE_KEY` | ✓ | Wallet private key |
+| `DREAMDEX_RPC_URL` | ✓ | Somnia RPC endpoint |
+| `DREAMDEX_SYMBOL` | ✓ | Market symbol e.g. `SOMI:USDso` |
+| `DREAMDEX_ENV` | | `staging` (Shannon) or `mainnet` |
+| `DREAMDEX_CHAIN_ID` | | `50312` (Shannon) or `5031` (mainnet) |
+| `DREAMDEX_DRY_RUN` | | `true` to skip tx broadcast |
 
-- `http`: use DreamDEX private HTTP endpoints to prepare the unsigned transaction, then sign and broadcast locally
-- `contract`: bypass private order-prep endpoints and call the SpotPool contract directly
+### Bot behaviour
 
-Notes:
+| Variable | Default | Description |
+|---|---|---|
+| `DREAMDEX_STRATEGY` | `threshold` | `grid`, `marketMaker`, `minuteRebalance`, `threshold` |
+| `DREAMDEX_EXECUTION_MODE` | `http` | `http` or `contract` |
+| `DREAMDEX_ALLOWED_SIDE` | `both` | `buy`, `sell`, or `both` |
+| `DREAMDEX_FUNDING_SOURCE` | `wallet` | `wallet` or `vault` |
+| `DREAMDEX_ORDER_TYPE` | `immediateOrCancel` | `immediateOrCancel`, `fillOrKill`, `normalOrder`, `postOnly` |
+| `DREAMDEX_COOLDOWN_MS` | `20000` | Minimum ms between orders |
+| `DREAMDEX_AUTO_VAULT` | `false` | Auto deposit/withdraw vault on start/stop |
+| `METRICS_PORT` | `0` | Port for dashboard metrics server (`0` = disabled) |
 
-- The bot still uses public HTTP + WebSocket market data in both modes.
-- `contract` mode is useful if you want the order-placement path to be fully on-chain from the bot.
-- Wallet-funded contract execution auto-checks ERC-20 allowance and submits `approve(...)` if needed.
-- Vault-funded contract execution assumes you already deposited funds into the pool vault.
-- On startup, the bot now verifies that `DREAMDEX_RPC_URL` is actually connected to `DREAMDEX_CHAIN_ID` and will stop early if they mismatch.
-- On startup, the bot also prints warnings for side-filter/threshold combinations that would otherwise surprise you.
-- In `marketMaker` strategy mode, the bot warns if you try to run one-sided quoting or HTTP execution on Shannon.
-- In `grid` strategy mode, the bot trades around a reference price using fixed quote clips and live wallet-seeded inventory.
+### Grid strategy
 
-## Testnet Notes
+| Variable | Default | Description |
+|---|---|---|
+| `DREAMDEX_GRID_TRADE_SIZE_QUOTE` | `20` | Quote notional per clip |
+| `DREAMDEX_GRID_STEP_BPS` | `8` | Distance between grid levels |
+| `DREAMDEX_GRID_MAX_SPREAD_BPS` | `25` | Skip if spread is wider |
+| `DREAMDEX_GRID_MAX_LONG_QUOTE` | `60` | Cap on open base position value |
+| `DREAMDEX_GRID_MAX_SESSION_LOSS_QUOTE` | `5` | Stop trading if equity drops by this |
+| `DREAMDEX_GRID_STUCK_TIMEOUT_MS` | `1200000` | Cut stuck position after this many ms |
 
-The newer DreamDEX docs currently show a testnet/staging environment for **Somnia Shannon**:
-- testnet chain ID: `50312`
-- documented staging REST base: `https://stg.api.dreamdex.io`
-- documented staging WS base: `wss://stg.api.dreamdex.io/v0/ws/public`
-- testnet `WETH:USDso` SpotPool: `0xD180195da5459C7a0DEA188ed61216ec43682b50`
-- testnet `WBTC:USDso` SpotPool: `0x3605f28aA7C50e7441211e77Cb0762d49539326C`
-- testnet `SOMI:USDso` SpotPool: `0x259fD6559214dd5aD3752322426eA9F9fABEFff4`
+---
 
-The docs are a little inconsistent because the testnet-oriented pages expose staging API server entries, while some quick-start examples still use the mainnet host. For now, this starter is configured around the documented staging endpoints in `/Users/0xmumin/Documents/projects/hackathons/sominia/trading/.env.example`.
+## Deployment
 
-## Important DreamDEX notes
+### Railway (recommended)
 
-Based on the current docs:
-- Chain ID is `5031` on Somnia mainnet.
-- Chain ID is `50312` on Somnia Shannon testnet.
-- Private HTTP endpoints use SIWE auth and `Authorization: Bearer <token>`.
-- The order endpoint returns an unsigned EVM transaction, not a confirmed order.
-- Wallet funding only supports IOC or FOK.
-- Resting GTC/PostOnly orders require vault funding.
-- If token allowance is insufficient, the API may return an `approval` transaction that must be sent first.
+1. Push repo to GitHub
+2. Create a new Railway project → **Deploy from GitHub repo**
+3. Set all env vars in the Railway **Variables** tab
+4. Railway auto-detects `build` and `start` scripts — no Dockerfile needed
 
-## Useful env vars
+The `railway.json` at the root configures restart-on-failure and the correct start command.
 
-- `DREAMDEX_SYMBOL`: market symbol like `WETH:USDso`
-- `DREAMDEX_STRATEGY`: `threshold`, `marketMaker`, `minuteRebalance`, or `grid`
-- `DREAMDEX_EXECUTION_MODE`: `http` or `contract`
-- `DREAMDEX_CHAIN_ID`: `5031` for mainnet or `50312` for Shannon testnet
-- `DREAMDEX_ORDER_AMOUNT`: base asset quantity to trade
-- `DREAMDEX_ALLOWED_SIDE`: `buy`, `sell`, or `both`
-- `DREAMDEX_BUY_BELOW_PRICE`: trigger level for buys
-- `DREAMDEX_SELL_ABOVE_PRICE`: trigger level for sells
-- `DREAMDEX_EXPIRE_SECONDS`: optional order expiry window used by contract mode, `0` for no expiry
-- `DREAMDEX_DRY_RUN`: `true` or `false`
-- `DREAMDEX_PERSISTENCE_DIR`: where bot state and execution journals are stored
-- `DREAMDEX_MM_STARTING_QUOTE_BALANCE_QUOTE`: quote inventory assumption for market-maker mode
-- `DREAMDEX_MM_STARTING_BASE_BALANCE`: starting SOMI/base inventory assumption for market-maker mode
-- `DREAMDEX_MM_QUOTE_SIZE_QUOTE`: per-trade notional in quote units for market-maker mode
-- `DREAMDEX_MM_TARGET_BASE_INVENTORY_QUOTE`: preferred amount of base inventory, measured in quote value
-- `DREAMDEX_MM_MAX_BASE_INVENTORY_QUOTE`: max base inventory before buy signals are suppressed
-- `DREAMDEX_MM_MIN_SPREAD_BPS`: minimum live spread needed before market-maker mode does anything
-- `DREAMDEX_MM_TARGET_HALF_SPREAD_BPS`: how far away from the anchor the market-maker wants each side to trade
-- `DREAMDEX_MM_INVENTORY_SKEW_BPS`: how strongly the anchor thresholds lean toward rebuilding the short side
-- `DREAMDEX_MM_MAX_SESSION_LOSS_QUOTE`: estimated mark-to-market loss cap before the market-maker pauses itself
-- `DREAMDEX_GRID_TRADE_SIZE_QUOTE`: quote notional per grid trade
-- `DREAMDEX_GRID_STEP_BPS`: distance between buy/sell grid steps
-- `DREAMDEX_GRID_MAX_SPREAD_BPS`: skip trading if live spread is wider than this
-- `DREAMDEX_GRID_MAX_LONG_QUOTE`: cap on tradable SOMI inventory value
+To deploy the dashboard as a separate Railway service, set `NEXT_PUBLIC_BOT_URL` to the bot service's public URL.
 
-Threshold env vars only matter when `DREAMDEX_STRATEGY=threshold`.
+### Local
 
-## Sell Native SOMI Only
-
-For a wallet-funded native SOMI sell test on Shannon testnet, a good starting setup is:
-
-```env
-DREAMDEX_SYMBOL=SOMI:USDso
-DREAMDEX_EXECUTION_MODE=contract
-DREAMDEX_FUNDING_SOURCE=wallet
-DREAMDEX_ORDER_TYPE=immediateOrCancel
-DREAMDEX_ALLOWED_SIDE=sell
-DREAMDEX_BUY_BELOW_PRICE=0
-DREAMDEX_SELL_ABOVE_PRICE=0.1709
+```bash
+pnpm build                                    # compile all packages
+pnpm --filter @trading/grid-bot run start     # run grid bot
+pnpm --filter @trading/scripts run start      # run swap loop
+pnpm --filter @trading/dashboard run start    # run dashboard
 ```
 
-Notes:
+---
 
-- native SOMI wallet sells use `msg.value` directly
-- no ERC-20 approval is needed to sell native SOMI
-- if you accidentally leave a large buy threshold set, the bot will now warn you when `DREAMDEX_ALLOWED_SIDE=sell`
+## Competition context
 
-## Extending this bot
+Built for the **DreamDEX Alpha Trading Competition** (Somnia Shannon testnet, 1 week, $50 SOMI capital). Primary KPI: trading volume.
 
-Good next upgrades:
-- add real resting maker order placement with vault funding plus cancel/replace loops
-- sync wallet and vault balances directly instead of relying on fill reconciliation plus configured starting inventory
-- persist pnl, equity curve, and per-trade stats
-- add a rebalance mode and a trend mode alongside the current threshold and market-maker strategies
-- add explicit kill-switches for max daily volume, max failed orders, and stale-orderbook conditions
+**Strategy**: Grid bot with `normalOrder` resting limits via vault funding, complemented by the swap loop for continuous volume generation. The grid captures small spread on each round-trip; the swap loop ensures consistent activity even when the grid is waiting for a trigger.
+
+**Architecture rationale**: The monorepo structure allows the SDK to be developed independently of the strategies, making it easy to add new bots or integrate with other Somnia DEXes without duplicating DreamDEX client logic.

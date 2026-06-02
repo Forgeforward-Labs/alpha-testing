@@ -14,26 +14,26 @@ The issues below are integration-level friction points, not fundamental problems
 
 ## Issues Encountered
 
-### 1. Order book frequently empty for extended periods
+### 1. Order book frequently empty across both WebSocket and REST
 
-**What happened:** During trading sessions the WebSocket order book would regularly be completely empty on one or both sides for minutes at a time. The bot's spread guard correctly skipped trading during these windows, but it made strategy evaluation unreliable — the grid strategy could not determine a reference price from an empty book, and buy/sell triggers never fired.
+**What happened:** During trading sessions the order book would regularly be completely empty on one or both sides for minutes at a time. This affected both the WebSocket feed and the `GET /v0/orderbook` REST endpoint simultaneously — it was not a streaming reconnect issue but a genuine state where no resting orders existed on the exchange. The bot's spread guard correctly skipped trading during these windows, but the grid strategy could not determine a reference price and buy/sell triggers never fired.
 
-**Impact:** Any bot that relies on live book data for pricing is effectively blind during these windows. For volume-based competitions this directly hurts participants who depend on the order book rather than fixed-price strategies.
+**Impact:** Any bot that relies on live book data for pricing is effectively blind during these windows. For volume-based competitions this directly hurts participants who depend on the order book rather than fixed-price strategies. Bots that use the REST endpoint as a fallback to the WebSocket are equally affected since both reflect the same empty state.
 
-**Suggestion:** 
+**Suggestion:**
 - Surface a "last known mid price" or "reference price" in the market metadata endpoint so bots can fall back gracefully
-- Consider a minimum liquidity guarantee on the testnet to keep the book usable for competition participants
-- Document the expected book state more clearly — is an empty book a known limitation of the testnet or a bug?
+- Consider a minimum liquidity guarantee during competition windows to keep the book usable for participants
+- Document the expected book state clearly — is an empty book a known limitation or a resolvable gap?
 
 ---
 
 ### 2. Setting `expiresAt = 0` returns an error
 
-**What happened:** The contract's `placeOrder` function accepts an `expiresAt` parameter. Setting it to `0` (intending "no expiry") caused the transaction to revert on-chain on Shannon testnet (chain ID `50312`). 
+**What happened:** The contract's `placeOrder` function accepts an `expiresAt` parameter. Setting it to `0` (intending "no expiry") caused the transaction to revert on both testnet and mainnet. The behaviour is consistent across environments — `0` is simply not accepted as a valid expiry value.
 
-**Workaround implemented:** The bot detects chain `50312` and substitutes a 1-hour expiry (`Math.floor(Date.now() / 1000) + 3600`) when `DREAMDEX_EXPIRE_SECONDS=0`.
+**Workaround implemented:** The bot substitutes a 1-hour expiry (`Math.floor(Date.now() / 1000) + 3600`) whenever `DREAMDEX_EXPIRE_SECONDS=0` is configured.
 
-**Impact:** This is not documented anywhere in the current API or contract reference. Developers building for mainnet will hit the same issue with no indication of why their transaction reverted. The error message from the RPC is generic and does not point to the expiry parameter.
+**Impact:** This is not documented anywhere in the current API or contract reference. Developers on both testnet and mainnet will hit this with no indication of why their transaction reverted. The RPC error message is generic and gives no hint that the expiry parameter is the cause.
 
 **Suggestion:**
 - Document the minimum valid `expiresAt` value (or that `0` is not a valid no-expiry sentinel)
@@ -65,7 +65,6 @@ The issues below are integration-level friction points, not fundamental problems
 - **Market metadata** (`GET /v0/markets`) is comprehensive — tick size, lot size, min quantity, contract address, and decimals in one call. This is exactly what a bot needs at startup.
 - **WebSocket order book** is low-latency and the snapshot/update message types are easy to reconstruct a local book from.
 - **`getWithdrawableBalance`** on the SpotPool contract is a clean way to check vault state without depending on any API endpoint. Appreciated for offline/contract-native workflows.
-- **The competition itself** is a great way to attract builder attention to Somnia. The leaderboard creates real motivation to build reliable, high-throughput bots rather than toy scripts.
 
 ---
 
@@ -78,7 +77,6 @@ The issues below are integration-level friction points, not fundamental problems
 | Medium | Surface a fallback reference price in the market API for empty-book conditions |
 | Medium | Fix docs environment inconsistency (staging vs mainnet examples) |
 | Low | Add a minimum book depth SLA or disclosure for testnet |
-| Low | Consider a TypeScript SDK — the DreamDEX HTTP + WebSocket interface is well-defined enough to warrant one |
 
 ---
 

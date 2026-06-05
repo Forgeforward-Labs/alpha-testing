@@ -158,17 +158,34 @@ async function main(): Promise<void> {
   }
 
   const pool = new Contract(market.contract, POOL_ABI, executor.getSigner());
-  const quoteToken = new Contract(
-    market.quote,
-    ERC20_ABI,
-    executor.getSigner(),
+  const quoteToken = new Contract(market.quote, ERC20_ABI, executor.getSigner());
+
+  const isNativeSomi = symbol.startsWith('SOMI:');
+  const walletBaseBefore = isNativeSomi
+    ? await executor.getNativeBalance()
+    : (await new Contract(market.base, ERC20_ABI, executor.getSigner()).balanceOf(config.walletAddress) as bigint);
+  const walletQuoteBefore = await quoteToken.balanceOf(config.walletAddress) as bigint;
+
+  console.log(`[http-test] Wallet base  balance before=${formatUnits(walletBaseBefore, market.baseDecimals)}`);
+  console.log(`[http-test] Wallet quote balance before=${formatUnits(walletQuoteBefore, market.quoteDecimals)}`);
+
+  // Pre-flight balance check — catch insufficient funds before hitting the chain.
+  const neededBase  = parseUnits(request.amount, market.baseDecimals);
+  const neededQuote = parseUnits(
+    (Number(request.amount) * Number(request.price)).toFixed(market.quoteDecimals),
+    market.quoteDecimals,
   );
-  const walletQuoteBefore = (await quoteToken.balanceOf(
-    config.walletAddress,
-  )) as bigint;
-  console.log(
-    `[http-test] Wallet quote balance before=${formatUnits(walletQuoteBefore, market.quoteDecimals)} for ${config.walletAddress}`,
-  );
+
+  if (side === 'sell' && walletBaseBefore < neededBase) {
+    throw new Error(
+      `Insufficient base balance: need ${request.amount} but wallet has ${formatUnits(walletBaseBefore, market.baseDecimals)}`,
+    );
+  }
+  if (side === 'buy' && walletQuoteBefore < neededQuote) {
+    throw new Error(
+      `Insufficient quote balance: need ${formatUnits(neededQuote, market.quoteDecimals)} but wallet has ${formatUnits(walletQuoteBefore, market.quoteDecimals)}`,
+    );
+  }
 
   if (config.dryRun) {
     console.log(

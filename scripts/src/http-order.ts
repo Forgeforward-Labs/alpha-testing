@@ -194,9 +194,9 @@ async function main(): Promise<void> {
     return;
   }
 
-  // Sell orders spend the base token — the API does not return an approval for
-  // this direction, so approve the market contract to pull the base tokens first.
-  if (side === 'sell') {
+  // ERC-20 sells need an approval so the contract can pull the base token.
+  // Native SOMI sells send msg.value directly — no approval contract exists.
+  if (side === 'sell' && !isNativeSomi) {
     const rawAmount = parseUnits(request.amount, market.baseDecimals);
     const approvalHash = await executor.ensureErc20Allowance(market.base, market.contract, rawAmount);
     if (approvalHash) {

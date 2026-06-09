@@ -175,7 +175,7 @@ async function main(): Promise<void> {
 
     // Effective buy size: cap to available quote so chop-reduced balances keep the
     // bot running with smaller clips rather than skipping cycles entirely.
-    const effectiveQuote = Math.min(SWAP_AMOUNT_QUOTE, quoteBalance);
+    let effectiveQuote = Math.min(SWAP_AMOUNT_QUOTE, quoteBalance);
 
     // Fetch book first so canBuy uses the live ask to check affordability precisely.
     const book = await http.getOrderBook(market.symbol, 3);
@@ -196,61 +196,55 @@ async function main(): Promise<void> {
 
     if (!canBuy && !canSell) {
       console.log('[swap] Insufficient balance on both sides — skipping cycle');
-    } else if (!canBuy && canSell) {
-      // Quote depleted but base available — sell first to recover quote.
-      const refPrice = bestBid ? Number(bestBid) : 0;
-      const targetBase = refPrice > 0
-        ? Math.min(tradableBase, SWAP_AMOUNT_QUOTE / refPrice)
-        : tradableBase;
-      const sellAmount = alignToStep(targetBase.toString(), market.lotSize);
-
-      console.log(
-        `[swap] Quote too low to buy (${quoteBalance.toFixed(4)}) — selling base first to recover quote`,
-      );
-
-      const soldAmount = await placeSide('sell', market, bestBid, bestAsk, executor, signer, sellAmount);
-      if (running && soldAmount) {
-        // Re-read quote balance after sell — effectiveQuote is stale (was the
-        // pre-sell dust balance), using it would compute a 0-size buy.
-        const quoteAfterRaw = await signer.getErc20Balance(market.quote);
-        const quoteAfter = Number(formatUnits(quoteAfterRaw, market.quoteDecimals));
-        const buyQuote = Math.min(SWAP_AMOUNT_QUOTE, quoteAfter);
-        console.log(`[swap] Recovered quote after sell: ${quoteAfter.toFixed(4)}`);
-
-        const freshBook = await http.getOrderBook(market.symbol, 3);
-        bestBid = freshBook?.bids[0]?.price ?? bestBid;
-        bestAsk = freshBook?.asks[0]?.price ?? bestAsk;
-        await placeSide('buy', market, bestBid, bestAsk, executor, signer, undefined, buyQuote);
-      }
     } else {
-      // Normal path: snapshot base before buy so we can detect partial fills.
-      const baseBeforeRaw = isNativeSomi
-        ? await signer.getNativeBalance()
-        : await signer.getErc20Balance(market.base);
+      // When quote is too low to buy, sell existing base first to recover it.
+      if (!canBuy && canSell) {
+        const sellQty = alignToStep(tradableBase.toString(), market.lotSize);
+        if (Number(sellQty) >= minQty) {
+          console.log(`[swap] Quote depleted (${quoteBalance.toFixed(4)}) — selling ${sellQty} base to recover`);
+          await placeSide('sell', market, bestBid, bestAsk, executor, signer, sellQty);
+          if (!running) break;
 
-      const boughtAmount = await placeSide('buy', market, bestBid, bestAsk, executor, signer, undefined, effectiveQuote);
-      if (running && boughtAmount) {
-        // Measure actual fill from wallet balance change — IOC orders can partially
-        // fill, and selling more than received causes an ERC-20 revert next leg.
-        const baseAfterRaw = isNativeSomi
-          ? await signer.getNativeBalance()
-          : await signer.getErc20Balance(market.base);
-        const fillRaw = baseAfterRaw > baseBeforeRaw ? baseAfterRaw - baseBeforeRaw : 0n;
-        const actualFill = alignToStep(
-          formatUnits(fillRaw, market.baseDecimals),
-          market.lotSize,
-        );
-
-        if (Number(actualFill) >= minQty) {
-          if (actualFill !== boughtAmount) {
-            console.log(`[swap] Partial fill detected: requested ${boughtAmount}, received ${actualFill}`);
-          }
-          const freshBook = await http.getOrderBook(market.symbol, 3);
+          const [freshBook, freshQuoteRaw] = await Promise.all([
+            http.getOrderBook(market.symbol, 3),
+            signer.getErc20Balance(market.quote),
+          ]);
           bestBid = freshBook?.bids[0]?.price ?? bestBid;
           bestAsk = freshBook?.asks[0]?.price ?? bestAsk;
-          await placeSide('sell', market, bestBid, bestAsk, executor, signer, actualFill);
-        } else {
-          console.log(`[swap] Fill too small to sell (${actualFill}), holding base`);
+          const freshQuote = Number(formatUnits(freshQuoteRaw, market.quoteDecimals));
+          effectiveQuote = Math.min(SWAP_AMOUNT_QUOTE, freshQuote);
+          console.log(`[swap] Recovered quote: ${freshQuote.toFixed(4)}`);
+        }
+      }
+
+      // Buy leg — only if quote is sufficient.
+      const canBuyNow = bestAsk ? effectiveQuote / Number(bestAsk) >= minQty : false;
+      if (!canBuyNow) {
+        console.log(`[swap] Insufficient quote (${effectiveQuote.toFixed(4)}) — skipping buy`);
+      } else {
+        const boughtAmount = await placeSide('buy', market, bestBid, bestAsk, executor, signer, undefined, effectiveQuote);
+        if (running && boughtAmount) {
+          // Read live base balance right before the sell so the sell quantity reflects
+          // the actual wallet state — this drains any residual base left by prior
+          // partial IOC sell fills in addition to what was just bought.
+          const baseNowRaw = isNativeSomi
+            ? await signer.getNativeBalance()
+            : await signer.getErc20Balance(market.base);
+          const baseNow = Number(formatUnits(baseNowRaw, market.baseDecimals));
+          const tradableNow = isNativeSomi ? Math.max(0, baseNow - GAS_RESERVE) : baseNow;
+          const sellQty = alignToStep(tradableNow.toString(), market.lotSize);
+
+          if (Number(sellQty) < minQty) {
+            console.log(`[swap] Buy fill too small to sell (${sellQty}) — will recover next cycle`);
+          } else {
+            if (Number(sellQty) > Number(boughtAmount)) {
+              console.log(`[swap] Selling full balance ${sellQty} (buy filled ${boughtAmount}, +${(Number(sellQty) - Number(boughtAmount)).toFixed(5)} prior residual)`);
+            }
+            const freshBook = await http.getOrderBook(market.symbol, 3);
+            bestBid = freshBook?.bids[0]?.price ?? bestBid;
+            bestAsk = freshBook?.asks[0]?.price ?? bestAsk;
+            await placeSide('sell', market, bestBid, bestAsk, executor, signer, sellQty);
+          }
         }
       }
     }

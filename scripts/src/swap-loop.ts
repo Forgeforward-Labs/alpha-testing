@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { Wallet, parseUnits, formatUnits } from 'ethers';
+import { MaxUint256, Wallet, parseUnits, formatUnits } from 'ethers';
 import { config } from './config.js';
 import { DreamDexHttpClient } from '@trading/sdk';
 import type { MarketInfo, PrepareOrderRequest, Side } from '@trading/sdk';
@@ -23,6 +23,29 @@ process.on('SIGTERM', () => {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function approveTokensMaxOnce(
+  signer: TransactionExecutor,
+  market: MarketInfo,
+  isNativeSomi: boolean,
+): Promise<void> {
+  const [base, quote] = market.symbol.split(':');
+  console.log('[swap] Checking token approvals...');
+
+  const quoteHash = await signer.ensureErc20Allowance(market.quote, market.contract, MaxUint256);
+  console.log(quoteHash
+    ? `[swap] ${quote} max approval tx: ${quoteHash}`
+    : `[swap] ${quote} already approved`,
+  );
+
+  if (!isNativeSomi) {
+    const baseHash = await signer.ensureErc20Allowance(market.base, market.contract, MaxUint256);
+    console.log(baseHash
+      ? `[swap] ${base} max approval tx: ${baseHash}`
+      : `[swap] ${base} already approved`,
+    );
+  }
 }
 
 // Returns the base amount placed, or undefined if the order was skipped.
@@ -144,6 +167,10 @@ async function main(): Promise<void> {
   }
 
   const isNativeSomi = market.symbol.startsWith('SOMI:');
+
+  if (!config.dryRun) {
+    await approveTokensMaxOnce(signer, market, isNativeSomi);
+  }
 
   console.log(`[swap] Symbol      : ${market.symbol}`);
   console.log(

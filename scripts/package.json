@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/swap-loop.js",
+    "start": "node dist/grid-maker.js",
     "dev": "tsx src/grid-maker.ts",
     "contract:buy": "tsx src/contract-order.ts buy",
     "contract:sell": "tsx src/contract-order.ts sell",

@@ -7,6 +7,7 @@ const VAULT_ABI = [
   'function depositNative() external payable',
   'function withdraw(address token, uint256 amount) external',
   'function getWithdrawableBalance(address owner, address token) external view returns (uint256)',
+  'function getOwnLockedBalance() external view returns (uint256 lockedBase, uint256 lockedQuote)',
 ] as const;
 
 export class VaultManager {
@@ -69,6 +70,23 @@ export class VaultManager {
   }
 
   async getVaultBalance(token: string): Promise<bigint> {
-    return (await this.pool.getWithdrawableBalance(this.executor.walletAddress, token)) as bigint;
+    const balance = (await this.pool.getWithdrawableBalance(this.executor.walletAddress, token)) as bigint;
+    // Native SOMI deposits go in via depositNative() and the vault stores them under address(0).
+    // If the API-provided token address returns 0, also try the zero-address sentinel.
+    if (balance === 0n && token !== '0x0000000000000000000000000000000000000000') {
+      try {
+        const native = (await this.pool.getWithdrawableBalance(
+          this.executor.walletAddress,
+          '0x0000000000000000000000000000000000000000',
+        )) as bigint;
+        if (native > 0n) return native;
+      } catch { /* not a native-capable vault */ }
+    }
+    return balance;
+  }
+
+  async getLockedBalance(): Promise<{ lockedBase: bigint; lockedQuote: bigint }> {
+    const [lockedBase, lockedQuote] = (await this.pool.getOwnLockedBalance()) as [bigint, bigint];
+    return { lockedBase, lockedQuote };
   }
 }

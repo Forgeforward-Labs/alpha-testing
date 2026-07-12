@@ -1,5 +1,8 @@
 import WebSocket from 'ws';
-import type { WebSocketOrderBookMessage } from './types.js';
+import type { WebSocketOrderBookMessage, WebSocketOrderMessage, WsOrder } from './types.js';
+
+type OrderBookCallback = (message: WebSocketOrderBookMessage) => Promise<void> | void;
+type OrderCallback = (order: WsOrder) => void;
 
 export class DreamDexWsClient {
   private ws?: WebSocket;
@@ -7,16 +10,68 @@ export class DreamDexWsClient {
   private intentionallyClosed = false;
   private reconnectDelay = 1_000;
 
+  // Keyed by decimal orderId string for fast lookup.
+  private orderCallbacks = new Map<string, OrderCallback>();
+  // Track which decimal orderIds we're subscribed to so we can re-subscribe on reconnect.
+  private subscribedOrders = new Set<string>();
+  // Track which orderbook symbols we're subscribed to for reconnect.
+  private subscribedSymbols = new Set<string>();
+
+  private orderbookCallback?: OrderBookCallback;
+
   constructor(private readonly url: string) {}
 
-  connect(onOrderBook: (message: WebSocketOrderBookMessage) => Promise<void> | void): Promise<void> {
+  connect(onOrderBook?: OrderBookCallback): Promise<void> {
+    this.orderbookCallback = onOrderBook;
     this.intentionallyClosed = false;
-    return this.openConnection(onOrderBook);
+    return this.openConnection();
   }
 
-  private openConnection(
-    onOrderBook: (message: WebSocketOrderBookMessage) => Promise<void> | void,
-  ): Promise<void> {
+  subscribeOrderBook(symbol: string): void {
+    this.subscribedSymbols.add(symbol);
+    this.send({
+      operation: 'subscribe',
+      channel: 'orderbook',
+      params: { symbols: [symbol] },
+    });
+  }
+
+  /**
+   * Subscribe to real-time updates for a specific order.
+   * orderId must be the decimal string returned by simulatedOrderId / REST API.
+   * The WS protocol expects hex, so conversion is handled internally.
+   */
+  subscribeOrder(orderId: string, onUpdate: OrderCallback): void {
+    this.orderCallbacks.set(orderId, onUpdate);
+    this.subscribedOrders.add(orderId);
+    this.send({
+      operation: 'subscribe',
+      channel: 'order',
+      params: { orderId: toHexId(orderId) },
+    });
+  }
+
+  unsubscribeOrder(orderId: string): void {
+    this.orderCallbacks.delete(orderId);
+    this.subscribedOrders.delete(orderId);
+    try {
+      this.send({
+        operation: 'unsubscribe',
+        channel: 'order',
+        params: { orderId: toHexId(orderId) },
+      });
+    } catch {
+      // Ignore if WS is closed — cleanup already handled by deleting the callback.
+    }
+  }
+
+  close(): void {
+    this.intentionallyClosed = true;
+    this.stopHeartbeat();
+    this.ws?.close();
+  }
+
+  private openConnection(): Promise<void> {
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(this.url);
       this.ws = ws;
@@ -24,6 +79,21 @@ export class DreamDexWsClient {
       ws.once('open', () => {
         this.reconnectDelay = 1_000;
         this.startHeartbeat();
+        // Re-subscribe to anything we were tracking before reconnect.
+        for (const symbol of this.subscribedSymbols) {
+          this.send({
+            operation: 'subscribe',
+            channel: 'orderbook',
+            params: { symbols: [symbol] },
+          });
+        }
+        for (const orderId of this.subscribedOrders) {
+          this.send({
+            operation: 'subscribe',
+            channel: 'order',
+            params: { orderId: toHexId(orderId) },
+          });
+        }
         resolve();
       });
 
@@ -37,23 +107,39 @@ export class DreamDexWsClient {
           return;
         }
 
-        const message = parsed as WebSocketOrderBookMessage | { operation?: string };
+        const message = parsed as { operation?: string; channel?: string };
 
-        if ('operation' in message && message.operation === 'pong') {
+        if (message.operation === 'pong') {
           return;
         }
 
-        if ('channel' in message && (message as WebSocketOrderBookMessage).channel === 'orderbook') {
+        if (message.channel === 'orderbook' && this.orderbookCallback) {
           try {
-            await onOrderBook(message as WebSocketOrderBookMessage);
+            await this.orderbookCallback(message as WebSocketOrderBookMessage);
           } catch (error) {
             console.error('WebSocket orderbook handler failed:', error);
+          }
+          return;
+        }
+
+        if (message.channel === 'order') {
+          const msg = message as WebSocketOrderMessage;
+          if (msg.order) {
+            // WS orderId is hex — normalize to decimal to find our callback.
+            const decimalId = toDecimalId(msg.order.id);
+            const cb = this.orderCallbacks.get(decimalId);
+            if (cb) {
+              try {
+                cb(msg.order);
+              } catch (error) {
+                console.error('WebSocket order handler failed:', error);
+              }
+            }
           }
         }
       });
 
       ws.once('error', (error) => {
-        // Fires before 'open' on connection failure; after 'open', 'close' will follow.
         if (ws.readyState === WebSocket.CONNECTING) {
           reject(error);
         } else {
@@ -63,34 +149,18 @@ export class DreamDexWsClient {
 
       ws.on('close', () => {
         this.stopHeartbeat();
-        if (this.intentionallyClosed) {
-          return;
-        }
+        if (this.intentionallyClosed) return;
         console.warn(`DreamDEX WebSocket disconnected; reconnecting in ${this.reconnectDelay}ms`);
         setTimeout(() => {
           if (!this.intentionallyClosed) {
             this.reconnectDelay = Math.min(this.reconnectDelay * 2, 30_000);
-            this.openConnection(onOrderBook).catch((error) => {
+            this.openConnection().catch((error) => {
               console.error('WebSocket reconnect failed:', error);
             });
           }
         }, this.reconnectDelay);
       });
     });
-  }
-
-  subscribeOrderBook(symbol: string): void {
-    this.send({
-      operation: 'subscribe',
-      channel: 'orderbook',
-      params: { symbols: [symbol] },
-    });
-  }
-
-  close(): void {
-    this.intentionallyClosed = true;
-    this.stopHeartbeat();
-    this.ws?.close();
   }
 
   private send(payload: unknown): void {
@@ -115,5 +185,19 @@ export class DreamDexWsClient {
       clearInterval(this.heartbeat);
       this.heartbeat = undefined;
     }
+  }
+}
+
+/** Convert decimal orderId (from REST/simulatedOrderId) to hex for WS subscribe. */
+function toHexId(decimalId: string): string {
+  return '0x' + BigInt(decimalId).toString(16);
+}
+
+/** Normalize a WS orderId (could be hex "0x..." or decimal) to decimal string for callback lookup. */
+function toDecimalId(id: string): string {
+  try {
+    return BigInt(id).toString();
+  } catch {
+    return id;
   }
 }

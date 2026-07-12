@@ -6,13 +6,18 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/swap-loop.js",
-    "dev": "tsx src/swap-loop.ts",
+    "dev": "tsx src/grid-maker.ts",
     "contract:buy": "tsx src/contract-order.ts buy",
     "contract:sell": "tsx src/contract-order.ts sell",
     "http:buy": "tsx src/http-order.ts buy",
     "http:sell": "tsx src/http-order.ts sell",
     "state:show": "tsx src/show-state.ts",
     "swap:loop": "tsx src/swap-loop.ts",
+    "grid:maker": "tsx src/grid-maker.ts",
+    "vault:balance": "tsx src/vault-balance.ts",
+    "vault:withdraw": "tsx src/vault-withdraw.ts",
+    "orders:cancel": "tsx src/cancel-orders.ts",
+    "swing:maker": "tsx src/swing-maker.ts",
     "type-check": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

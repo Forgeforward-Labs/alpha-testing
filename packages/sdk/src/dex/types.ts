@@ -116,3 +116,23 @@ export interface WebSocketOrderBookMessage {
   timestamp?: number;
   description?: string;
 }
+
+export interface WsOrder {
+  id: string;              // hex format: "0x..."
+  symbol?: string;
+  side: 'buy' | 'sell';
+  price: string;           // limit price
+  quantity: string;        // original order quantity
+  filled?: string;         // cumulative filled quantity
+  remaining?: string;      // unfilled quantity
+  executionPrice?: string; // average fill price (if provided by the feed)
+  status: 'open' | 'partial' | 'filled' | 'cancelled';
+  createdAt?: number;
+  updatedAt?: number;
+}
+
+export interface WebSocketOrderMessage {
+  channel: 'order';
+  type: 'snapshot' | 'update';
+  order: WsOrder;
+}

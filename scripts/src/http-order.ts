@@ -119,6 +119,7 @@ async function main(): Promise<void> {
   await executor.assertConnectedChain();
 
   const markets = await http.listMarkets();
+  console.log(markets);
   const market = markets.find((item) => item.symbol === symbol);
   if (!market) {
     throw new Error(`Market not found: ${symbol}`);
@@ -126,8 +127,8 @@ async function main(): Promise<void> {
 
   const orderBook = await http.getOrderBook(symbol, 5);
   console.log(orderBook);
-  const bestBid = orderBook?.bids[0]?.price;
-  const bestAsk = orderBook?.asks[0]?.price;
+  const bestBid = orderBook?.bids[1]?.price;
+  const bestAsk = orderBook?.asks[1]?.price;
   const price = resolvePrice(side, market, bestBid, bestAsk);
   const request = buildRequest(side, market, price, amount);
 
@@ -158,21 +159,37 @@ async function main(): Promise<void> {
   }
 
   const pool = new Contract(market.contract, POOL_ABI, executor.getSigner());
-  const quoteToken = new Contract(market.quote, ERC20_ABI, executor.getSigner());
+  const quoteToken = new Contract(
+    market.quote,
+    ERC20_ABI,
+    executor.getSigner(),
+  );
 
   const isNativeSomi = symbol.startsWith('SOMI:');
   const walletBaseBefore = isNativeSomi
     ? await executor.getNativeBalance()
-    : (await new Contract(market.base, ERC20_ABI, executor.getSigner()).balanceOf(config.walletAddress) as bigint);
-  const walletQuoteBefore = await quoteToken.balanceOf(config.walletAddress) as bigint;
+    : ((await new Contract(
+        market.base,
+        ERC20_ABI,
+        executor.getSigner(),
+      ).balanceOf(config.walletAddress)) as bigint);
+  const walletQuoteBefore = (await quoteToken.balanceOf(
+    config.walletAddress,
+  )) as bigint;
 
-  console.log(`[http-test] Wallet base  balance before=${formatUnits(walletBaseBefore, market.baseDecimals)}`);
-  console.log(`[http-test] Wallet quote balance before=${formatUnits(walletQuoteBefore, market.quoteDecimals)}`);
+  console.log(
+    `[http-test] Wallet base  balance before=${formatUnits(walletBaseBefore, market.baseDecimals)}`,
+  );
+  console.log(
+    `[http-test] Wallet quote balance before=${formatUnits(walletQuoteBefore, market.quoteDecimals)}`,
+  );
 
   // Pre-flight balance check — catch insufficient funds before hitting the chain.
-  const neededBase  = parseUnits(request.amount, market.baseDecimals);
+  const neededBase = parseUnits(request.amount, market.baseDecimals);
   const neededQuote = parseUnits(
-    (Number(request.amount) * Number(request.price)).toFixed(market.quoteDecimals),
+    (Number(request.amount) * Number(request.price)).toFixed(
+      market.quoteDecimals,
+    ),
     market.quoteDecimals,
   );
 
@@ -181,11 +198,11 @@ async function main(): Promise<void> {
       `Insufficient base balance: need ${request.amount} but wallet has ${formatUnits(walletBaseBefore, market.baseDecimals)}`,
     );
   }
-  if (side === 'buy' && walletQuoteBefore < neededQuote) {
-    throw new Error(
-      `Insufficient quote balance: need ${formatUnits(neededQuote, market.quoteDecimals)} but wallet has ${formatUnits(walletQuoteBefore, market.quoteDecimals)}`,
-    );
-  }
+  // if (side === 'buy' && walletQuoteBefore < neededQuote) {
+  //   throw new Error(
+  //     `Insufficient quote balance: need ${formatUnits(neededQuote, market.quoteDecimals)} but wallet has ${formatUnits(walletQuoteBefore, market.quoteDecimals)}`,
+  //   );
+  // }
 
   if (config.dryRun) {
     console.log(
@@ -198,7 +215,11 @@ async function main(): Promise<void> {
   // Native SOMI sells send msg.value directly — no approval contract exists.
   if (side === 'sell' && !isNativeSomi) {
     const rawAmount = parseUnits(request.amount, market.baseDecimals);
-    const approvalHash = await executor.ensureErc20Allowance(market.base, market.contract, rawAmount);
+    const approvalHash = await executor.ensureErc20Allowance(
+      market.base,
+      market.contract,
+      rawAmount,
+    );
     if (approvalHash) {
       console.log(`[http-test] Base token approval tx: ${approvalHash}`);
     }

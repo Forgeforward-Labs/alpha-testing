@@ -30,6 +30,10 @@ export const config = {
   fundingSource: optional('DREAMDEX_FUNDING_SOURCE', 'wallet') as FundingSource,
   orderType: optional('DREAMDEX_ORDER_TYPE', 'immediateOrCancel') as OrderType,
   selfMatchingOption: optional('DREAMDEX_SELF_MATCHING_OPTION', 'cancelTaker') as SelfMatchingOption,
+  wsUrl: optional(
+    'DREAMDEX_WS_URL',
+    envName === 'staging' ? 'wss://stg.api.dreamdex.io/v0/ws/public' : 'wss://api.dreamdex.io/v0/ws/public',
+  ),
   siweDomain: optional('DREAMDEX_SIWE_DOMAIN', 'dreamdex.somnia.host'),
   siweUri: optional('DREAMDEX_SIWE_URI', 'https://dreamdex.somnia.host'),
   expireSeconds: Number(optional('DREAMDEX_EXPIRE_SECONDS', '0')),

@@ -7,7 +7,9 @@ import { HttpOrderExecutor } from '@trading/sdk';
 import { TransactionExecutor } from '@trading/sdk';
 import { adjustPriceByBps, alignToStep } from '@trading/sdk';
 
-const SWAP_AMOUNT_QUOTE = Number(process.env.DREAMDEX_SWAP_AMOUNT_QUOTE ?? '10');
+const SWAP_AMOUNT_QUOTE = Number(
+  process.env.DREAMDEX_SWAP_AMOUNT_QUOTE ?? '10',
+);
 const SLIPPAGE_BPS = Number(process.env.DREAMDEX_SWAP_SLIPPAGE_BPS ?? '5');
 const CYCLE_MS = Number(process.env.DREAMDEX_SWAP_CYCLE_MS ?? '15000');
 const GAS_RESERVE = Number(process.env.DREAMDEX_GAS_RESERVE ?? '0.02');
@@ -33,17 +35,27 @@ async function approveTokensMaxOnce(
   const [base, quote] = market.symbol.split(':');
   console.log('[swap] Checking token approvals...');
 
-  const quoteHash = await signer.ensureErc20Allowance(market.quote, market.contract, MaxUint256);
-  console.log(quoteHash
-    ? `[swap] ${quote} max approval tx: ${quoteHash}`
-    : `[swap] ${quote} already approved`,
+  const quoteHash = await signer.ensureErc20Allowance(
+    market.quote,
+    market.contract,
+    MaxUint256,
+  );
+  console.log(
+    quoteHash
+      ? `[swap] ${quote} max approval tx: ${quoteHash}`
+      : `[swap] ${quote} already approved`,
   );
 
   if (!isNativeSomi) {
-    const baseHash = await signer.ensureErc20Allowance(market.base, market.contract, MaxUint256);
-    console.log(baseHash
-      ? `[swap] ${base} max approval tx: ${baseHash}`
-      : `[swap] ${base} already approved`,
+    const baseHash = await signer.ensureErc20Allowance(
+      market.base,
+      market.contract,
+      MaxUint256,
+    );
+    console.log(
+      baseHash
+        ? `[swap] ${base} max approval tx: ${baseHash}`
+        : `[swap] ${base} already approved`,
     );
   }
 }
@@ -79,10 +91,7 @@ async function placeSide(
   const quoteToUse = effectiveQuoteAmount ?? SWAP_AMOUNT_QUOTE;
   const baseAmount =
     fixedBaseAmount ??
-    alignToStep(
-      (quoteToUse / Number(reference)).toString(),
-      market.lotSize,
-    );
+    alignToStep((quoteToUse / Number(price)).toString(), market.lotSize);
 
   if (Number(baseAmount) < Number(market.minQuantity)) {
     console.log(
@@ -161,6 +170,7 @@ async function main(): Promise<void> {
   await signer.assertConnectedChain();
 
   const markets = await http.listMarkets();
+  console.log(markets);
   const market = markets.find((m) => m.symbol === config.symbol);
   if (!market) {
     throw new Error(`Market not found: ${config.symbol}`);
@@ -193,12 +203,16 @@ async function main(): Promise<void> {
 
     // Check live balances to decide which side goes first this cycle.
     const [baseRaw, quoteRaw] = await Promise.all([
-      isNativeSomi ? signer.getNativeBalance() : signer.getErc20Balance(market.base),
+      isNativeSomi
+        ? signer.getNativeBalance()
+        : signer.getErc20Balance(market.base),
       signer.getErc20Balance(market.quote),
     ]);
     const baseBalance = Number(formatUnits(baseRaw, market.baseDecimals));
     const quoteBalance = Number(formatUnits(quoteRaw, market.quoteDecimals));
-    const tradableBase = isNativeSomi ? Math.max(0, baseBalance - GAS_RESERVE) : baseBalance;
+    const tradableBase = isNativeSomi
+      ? Math.max(0, baseBalance - GAS_RESERVE)
+      : baseBalance;
 
     // Effective buy size: cap to available quote so chop-reduced balances keep the
     // bot running with smaller clips rather than skipping cycles entirely.
@@ -217,7 +231,9 @@ async function main(): Promise<void> {
 
     console.log(
       `[swap] Balances: base=${baseBalance.toFixed(4)} (tradable=${tradableBase.toFixed(4)}) quote=${quoteBalance.toFixed(4)}` +
-        (effectiveQuote < SWAP_AMOUNT_QUOTE ? ` [using ${effectiveQuote.toFixed(4)} quote this cycle]` : '') +
+        (effectiveQuote < SWAP_AMOUNT_QUOTE
+          ? ` [using ${effectiveQuote.toFixed(4)} quote this cycle]`
+          : '') +
         ` | canBuy=${canBuy} canSell=${canSell}`,
     );
 
@@ -228,8 +244,18 @@ async function main(): Promise<void> {
       if (!canBuy && canSell) {
         const sellQty = alignToStep(tradableBase.toString(), market.lotSize);
         if (Number(sellQty) >= minQty) {
-          console.log(`[swap] Quote depleted (${quoteBalance.toFixed(4)}) — selling ${sellQty} base to recover`);
-          await placeSide('sell', market, bestBid, bestAsk, executor, signer, sellQty);
+          console.log(
+            `[swap] Quote depleted (${quoteBalance.toFixed(4)}) — selling ${sellQty} base to recover`,
+          );
+          await placeSide(
+            'sell',
+            market,
+            bestBid,
+            bestAsk,
+            executor,
+            signer,
+            sellQty,
+          );
           if (!running) break;
 
           const [freshBook, freshQuoteRaw] = await Promise.all([
@@ -238,18 +264,33 @@ async function main(): Promise<void> {
           ]);
           bestBid = freshBook?.bids[0]?.price ?? bestBid;
           bestAsk = freshBook?.asks[0]?.price ?? bestAsk;
-          const freshQuote = Number(formatUnits(freshQuoteRaw, market.quoteDecimals));
+          const freshQuote = Number(
+            formatUnits(freshQuoteRaw, market.quoteDecimals),
+          );
           effectiveQuote = Math.min(SWAP_AMOUNT_QUOTE, freshQuote);
           console.log(`[swap] Recovered quote: ${freshQuote.toFixed(4)}`);
         }
       }
 
       // Buy leg — only if quote is sufficient.
-      const canBuyNow = bestAsk ? effectiveQuote / Number(bestAsk) >= minQty : false;
+      const canBuyNow = bestAsk
+        ? effectiveQuote / Number(bestAsk) >= minQty
+        : false;
       if (!canBuyNow) {
-        console.log(`[swap] Insufficient quote (${effectiveQuote.toFixed(4)}) — skipping buy`);
+        console.log(
+          `[swap] Insufficient quote (${effectiveQuote.toFixed(4)}) — skipping buy`,
+        );
       } else {
-        const boughtAmount = await placeSide('buy', market, bestBid, bestAsk, executor, signer, undefined, effectiveQuote);
+        const boughtAmount = await placeSide(
+          'buy',
+          market,
+          bestBid,
+          bestAsk,
+          executor,
+          signer,
+          undefined,
+          effectiveQuote,
+        );
         if (running && boughtAmount) {
           // Read live base balance right before the sell so the sell quantity reflects
           // the actual wallet state — this drains any residual base left by prior
@@ -258,19 +299,33 @@ async function main(): Promise<void> {
             ? await signer.getNativeBalance()
             : await signer.getErc20Balance(market.base);
           const baseNow = Number(formatUnits(baseNowRaw, market.baseDecimals));
-          const tradableNow = isNativeSomi ? Math.max(0, baseNow - GAS_RESERVE) : baseNow;
+          const tradableNow = isNativeSomi
+            ? Math.max(0, baseNow - GAS_RESERVE)
+            : baseNow;
           const sellQty = alignToStep(tradableNow.toString(), market.lotSize);
 
           if (Number(sellQty) < minQty) {
-            console.log(`[swap] Buy fill too small to sell (${sellQty}) — will recover next cycle`);
+            console.log(
+              `[swap] Buy fill too small to sell (${sellQty}) — will recover next cycle`,
+            );
           } else {
             if (Number(sellQty) > Number(boughtAmount)) {
-              console.log(`[swap] Selling full balance ${sellQty} (buy filled ${boughtAmount}, +${(Number(sellQty) - Number(boughtAmount)).toFixed(5)} prior residual)`);
+              console.log(
+                `[swap] Selling full balance ${sellQty} (buy filled ${boughtAmount}, +${(Number(sellQty) - Number(boughtAmount)).toFixed(5)} prior residual)`,
+              );
             }
             const freshBook = await http.getOrderBook(market.symbol, 3);
             bestBid = freshBook?.bids[0]?.price ?? bestBid;
             bestAsk = freshBook?.asks[0]?.price ?? bestAsk;
-            await placeSide('sell', market, bestBid, bestAsk, executor, signer, sellQty);
+            await placeSide(
+              'sell',
+              market,
+              bestBid,
+              bestAsk,
+              executor,
+              signer,
+              sellQty,
+            );
           }
         }
       }

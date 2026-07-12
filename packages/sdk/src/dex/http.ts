@@ -57,6 +57,39 @@ export class DreamDexHttpClient {
     });
   }
 
+  async prepareCancel(symbol: string, orderId: string): Promise<UnsignedTransactionPayload> {
+    await this.ensureAuthenticated();
+    return this.request<UnsignedTransactionPayload>(
+      `/v0/markets/${encodeURIComponent(symbol)}/orders/${encodeURIComponent(orderId)}`,
+      { method: 'DELETE', auth: true, retries: 0 },
+    );
+  }
+
+  async listOrders(symbol: string, status?: string, limit = 100): Promise<Order[]> {
+    await this.ensureAuthenticated();
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (status) query.set('status', status);
+    const response = await this.request<{ orders: Order[]; nextCursor?: string }>(
+      `/v0/markets/${encodeURIComponent(symbol)}/orders?${query.toString()}`,
+      { auth: true, retries: 2 },
+    );
+    return response.orders ?? [];
+  }
+
+  async listAllOrders(symbols?: string[], status?: string, limit = 100): Promise<Order[]> {
+    await this.ensureAuthenticated();
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (status) query.set('status', status);
+    if (symbols?.length) {
+      symbols.forEach((s) => query.append('symbols', s));
+    }
+    const response = await this.request<{ orders: Order[]; nextCursor?: string }>(
+      `/v0/orders?${query.toString()}`,
+      { auth: true, retries: 2 },
+    );
+    return response.orders ?? [];
+  }
+
   private async ensureAuthenticated(): Promise<void> {
     const now = Date.now();
     if (this.token && this.tokenExpiresAt && now < this.tokenExpiresAt - 60_000) {

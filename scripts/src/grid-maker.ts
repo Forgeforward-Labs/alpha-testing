@@ -133,6 +133,18 @@ class Grid {
     const qtyStr   = alignToStep(qty.toFixed(8),   this.market.lotSize);
     if (Number(qtyStr) < Number(this.market.minQuantity)) return;
 
+    // Pre-check wallet quote balance.
+    try {
+      const walletQuote = Number(formatUnits(
+        await this.signer.getErc20Balance(this.market.quote),
+        this.market.quoteDecimals,
+      ));
+      if (walletQuote < LOT_USDSO) {
+        log(`[grid] Wallet quote $${walletQuote.toFixed(2)} < $${LOT_USDSO} — skip buy`);
+        return;
+      }
+    } catch { /* proceed */ }
+
     // Snapshot wallet WETH before — delta after tx confirms actual fill.
     let baseBefore = 0n;
     try { baseBefore = await this.signer.getErc20Balance(this.market.base); } catch { /* 0 */ }

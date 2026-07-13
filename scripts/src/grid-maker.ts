@@ -1,11 +1,10 @@
 import 'dotenv/config';
-import { Wallet, formatUnits } from 'ethers';
+import { Wallet } from 'ethers';
 import { config as envConfig } from './config.js';
 import {
   DreamDexHttpClient,
   ContractOrderExecutor,
   TransactionExecutor,
-  VaultManager,
 } from '@trading/sdk';
 import type { MarketInfo } from '@trading/sdk';
 import { alignToStep } from '@trading/sdk';
@@ -37,8 +36,9 @@ interface Lot { price: number; qty: number; }
 
 // ── Grid ──────────────────────────────────────────────────────────────────────
 // Tick-based grid: buy on dip below anchor, sell on bounce above entry.
-// Execution: IOC taker when counterpart exists; PostOnly maker when book is thin.
-// Vault balance deltas confirm actual fills (IOC may cancel without error).
+// IOC taker when counterpart exists; PostOnly maker when book is thin.
+// Lots are tracked optimistically — tx success = filled.
+// Stuck timeout clears phantom lots if sell trigger is never reached.
 
 class Grid {
   private lots: Lot[] = [];
@@ -53,13 +53,7 @@ class Grid {
     private readonly market: MarketInfo,
     private readonly executor: ContractOrderExecutor,
     private readonly http: DreamDexHttpClient,
-    private readonly vault: VaultManager | undefined,
   ) {}
-
-  // Add base already in vault as a synthetic lot (for reconciliation at startup).
-  addSyntheticLot(price: number, qty: number): void {
-    this.lots.push({ price, qty });
-  }
 
   async tick(): Promise<void> {
     this.tickCount++;
@@ -135,33 +129,12 @@ class Grid {
 
   private async buy(triggerPrice: number, bestAsk: number, qty: number): Promise<void> {
     // IOC when there's an ask to take; PostOnly to rest as maker when book is thin.
-    const hasAsk  = Number.isFinite(bestAsk);
-    const price   = hasAsk ? bestAsk    : triggerPrice;
-    const otype   = hasAsk ? 'immediateOrCancel' as const : 'postOnly' as const;
+    const hasAsk   = Number.isFinite(bestAsk);
+    const price    = hasAsk ? bestAsk    : triggerPrice;
+    const otype    = hasAsk ? 'immediateOrCancel' as const : 'postOnly' as const;
     const priceStr = alignToStep(price.toFixed(8), this.market.tickSize);
     const qtyStr   = alignToStep(qty.toFixed(8),   this.market.lotSize);
     if (Number(qtyStr) < Number(this.market.minQuantity)) return;
-
-    if (envConfig.dryRun) {
-      this.lots.push({ price, qty: Number(qtyStr) });
-      this.totalVolume += price * Number(qtyStr);
-      log(`[grid] [dry] BUY ${qtyStr} @ ${priceStr} (${otype}) lots=${this.lots.length}`);
-      return;
-    }
-
-    // Vault quote pre-check.
-    if (this.vault) {
-      try {
-        const fq = Number(formatUnits(await this.vault.getVaultBalance(this.market.quote), this.market.quoteDecimals));
-        if (fq < LOT_USDSO) { log(`[grid] Vault $${fq.toFixed(2)} < $${LOT_USDSO} — skip buy`); return; }
-      } catch { /* proceed */ }
-    }
-
-    // Snapshot base before to confirm fill via delta.
-    let baseBefore = 0n;
-    if (this.vault) {
-      try { baseBefore = await this.vault.getVaultBalance(this.market.base); } catch { /* 0 */ }
-    }
 
     try {
       const res = await this.executor.executeOrder(this.market, {
@@ -175,22 +148,10 @@ class Grid {
         selfMatchingOption: 'cancelTaker',
       });
 
-      if (this.vault) {
-        const baseAfter = await this.vault.getVaultBalance(this.market.base);
-        const delta = baseAfter - baseBefore;
-        const filled = delta > 0n ? Number(formatUnits(delta, this.market.baseDecimals)) : 0;
-        if (filled > 0) {
-          this.lots.push({ price, qty: filled });
-          this.totalVolume += price * filled;
-          log(`[grid] ✓ BUY ${filled.toFixed(6)} @ ${priceStr} (${otype})  lots=${this.lots.length}  pnl=$${this.realizedPnl.toFixed(4)}  vol=$${this.totalVolume.toFixed(2)}  tx=${res.txHash}`);
-        } else {
-          log(`[grid] ✗ BUY no fill @ ${priceStr} (${otype} cancelled)  tx=${res.txHash}`);
-        }
-      } else {
-        this.lots.push({ price, qty: Number(qtyStr) });
-        this.totalVolume += price * Number(qtyStr);
-        log(`[grid] BUY ${qtyStr} @ ${priceStr} (${otype})  tx=${res.txHash}`);
-      }
+      const filled = Number(qtyStr);
+      this.lots.push({ price, qty: filled });
+      this.totalVolume += price * filled;
+      log(`[grid] ✓ BUY ${qtyStr} @ ${priceStr} (${otype})  lots=${this.lots.length}  pnl=$${this.realizedPnl.toFixed(4)}  vol=$${this.totalVolume.toFixed(2)}  tx=${res.txHash}`);
     } catch (err) {
       logErr(`[grid] BUY failed @ ${priceStr}`, err);
     }
@@ -198,34 +159,7 @@ class Grid {
 
   private async sell(bestBid: number, qty: number): Promise<void> {
     const priceStr = alignToStep(bestBid.toFixed(8), this.market.tickSize);
-
-    if (envConfig.dryRun) {
-      const qtyStr = alignToStep(qty.toFixed(8), this.market.lotSize);
-      this.closeLots(Number(qtyStr), bestBid);
-      this.trips++;
-      log(`[grid] [dry] SELL ${qtyStr} @ ${priceStr} (IOC)  pnl=$${this.realizedPnl.toFixed(4)}`);
-      return;
-    }
-
-    // Check actual vault base — IOC buy might not have filled; vault is truth.
-    let baseBefore: bigint;
-    try {
-      baseBefore = await this.vault!.getVaultBalance(this.market.base);
-    } catch {
-      log('[grid] Could not read vault base — skip sell');
-      return;
-    }
-    const actualBase = Number(formatUnits(baseBefore, this.market.baseDecimals));
-    const toSell = Math.min(qty, actualBase);
-    if (toSell < Number(this.market.minQuantity)) {
-      if (this.lots.length > 0) {
-        log(`[grid] Vault base ${actualBase.toFixed(6)} too low — clearing ${this.lots.length} phantom lot(s)`);
-        this.lots = [];
-      }
-      return;
-    }
-
-    const qtyStr = alignToStep(toSell.toFixed(8), this.market.lotSize);
+    const qtyStr   = alignToStep(qty.toFixed(8),     this.market.lotSize);
     if (Number(qtyStr) < Number(this.market.minQuantity)) { this.lots = []; return; }
 
     try {
@@ -240,19 +174,15 @@ class Grid {
         selfMatchingOption: 'cancelTaker',
       });
 
-      const baseAfter = await this.vault!.getVaultBalance(this.market.base);
-      const delta = baseBefore - baseAfter;
-      const sold  = delta > 0n ? Number(formatUnits(delta, this.market.baseDecimals)) : 0;
-      if (sold > 0) {
-        this.closeLots(sold, bestBid);
-        this.trips++;
-        this.totalVolume += bestBid * sold;
-        log(`[grid] ✓ SELL ${sold.toFixed(6)} @ ${priceStr} (IOC)  trips=${this.trips}  pnl=$${this.realizedPnl.toFixed(4)}  vol=$${this.totalVolume.toFixed(2)}  tx=${res.txHash}`);
-      } else {
-        log(`[grid] ✗ SELL no fill @ ${priceStr} (IOC cancelled)  tx=${res.txHash}`);
-      }
+      const sold = Number(qtyStr);
+      this.closeLots(sold, bestBid);
+      this.trips++;
+      this.totalVolume += bestBid * sold;
+      log(`[grid] ✓ SELL ${qtyStr} @ ${priceStr} (IOC)  trips=${this.trips}  pnl=$${this.realizedPnl.toFixed(4)}  vol=$${this.totalVolume.toFixed(2)}  tx=${res.txHash}`);
     } catch (err) {
       logErr(`[grid] SELL failed @ ${priceStr}`, err);
+      // Revert means no base in vault — phantom lots, clear them.
+      this.lots = [];
     }
   }
 
@@ -289,44 +219,15 @@ async function main(): Promise<void> {
   const market  = markets.find((m) => m.symbol === envConfig.symbol);
   if (!market) throw new Error(`Market not found: ${envConfig.symbol}`);
 
-  log(`[grid] Symbol : ${market.symbol}`);
-  log(`[grid] Step   : ${STEP_BPS}bps`);
-  log(`[grid] Lot    : $${LOT_USDSO}`);
-  log(`[grid] MaxInv : $${MAX_INVENTORY}`);
+  log(`[grid] Symbol  : ${market.symbol}`);
+  log(`[grid] Step    : ${STEP_BPS}bps`);
+  log(`[grid] Lot     : $${LOT_USDSO}`);
+  log(`[grid] MaxInv  : $${MAX_INVENTORY}`);
   log(`[grid] StopLoss: $${MAX_SESSION_LOSS}`);
   log(`[grid] StuckAt : ${STUCK_MS / 60_000}min`);
-  log(`[grid] Poll   : ${POLL_MS}ms`);
+  log(`[grid] Poll    : ${POLL_MS}ms`);
 
-  const vault = envConfig.dryRun ? undefined : new VaultManager(signer, market.contract);
-
-  if (vault) {
-    const fq = Number(formatUnits(await vault.getVaultBalance(market.quote), market.quoteDecimals));
-    log(`[grid] Vault quote: $${fq.toFixed(2)}`);
-    if (fq < LOT_USDSO) {
-      log('[grid] Vault low — topping up from wallet...');
-      await vault.depositAll(market, '0.02');
-      const fqAfter = Number(formatUnits(await vault.getVaultBalance(market.quote), market.quoteDecimals));
-      log(`[grid] Vault after deposit: $${fqAfter.toFixed(2)}`);
-    }
-  }
-
-  const grid = new Grid(market, executor, http, vault);
-
-  // Adopt any existing base balance in vault as a synthetic lot at current mid.
-  if (vault) {
-    const baseRaw = await vault.getVaultBalance(market.base);
-    const baseNum = Number(formatUnits(baseRaw, market.baseDecimals));
-    if (baseNum >= Number(market.minQuantity)) {
-      const initBook = await http.getOrderBook(market.symbol, 3);
-      const initMid  = initBook
-        ? (Number(initBook.bids[0]?.price ?? 0) + Number(initBook.asks[0]?.price ?? 0)) / 2
-        : 0;
-      if (initMid > 0) {
-        grid.addSyntheticLot(initMid, baseNum);
-        log(`[grid] Adopted ${baseNum.toFixed(6)} existing base as lot @ mid ${initMid.toFixed(4)}`);
-      }
-    }
-  }
+  const grid = new Grid(market, executor, http);
 
   log('[grid] Starting tick loop...');
   while (running) {

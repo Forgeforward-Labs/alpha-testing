@@ -65,10 +65,6 @@ class Grid {
     if (bestBid === undefined || bestAsk === undefined) return;
 
     const mid = (bestBid + bestAsk) / 2;
-    // When flat, track current mid so buyTrigger always stays near market.
-    if (this.lots.length === 0) {
-      this.anchor = mid;
-    }
     this.anchor ??= mid;
 
     const spreadBps = ((bestAsk - bestBid) / bestBid) * 10_000;

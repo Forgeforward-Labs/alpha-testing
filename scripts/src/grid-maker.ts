@@ -1,10 +1,11 @@
 import 'dotenv/config';
-import { Wallet } from 'ethers';
+import { Wallet, formatUnits } from 'ethers';
 import { config as envConfig } from './config.js';
 import {
   DreamDexHttpClient,
   ContractOrderExecutor,
   TransactionExecutor,
+  VaultManager,
 } from '@trading/sdk';
 import type { MarketInfo } from '@trading/sdk';
 import { alignToStep } from '@trading/sdk';
@@ -36,9 +37,8 @@ interface Lot { price: number; qty: number; }
 
 // ── Grid ──────────────────────────────────────────────────────────────────────
 // Tick-based grid: buy on dip below anchor, sell on bounce above entry.
-// IOC taker when counterpart exists; PostOnly maker when book is thin.
-// Lots are tracked optimistically — tx success = filled.
-// Stuck timeout clears phantom lots if sell trigger is never reached.
+// Both sides use IOC. Vault balance deltas confirm actual fills so phantom
+// lots from cancelled IOC orders never accumulate.
 
 class Grid {
   private lots: Lot[] = [];
@@ -53,6 +53,7 @@ class Grid {
     private readonly market: MarketInfo,
     private readonly executor: ContractOrderExecutor,
     private readonly http: DreamDexHttpClient,
+    private readonly vault: VaultManager,
   ) {}
 
   async tick(): Promise<void> {
@@ -133,6 +134,9 @@ class Grid {
     const qtyStr   = alignToStep(qty.toFixed(8),   this.market.lotSize);
     if (Number(qtyStr) < Number(this.market.minQuantity)) return;
 
+    let baseBefore = 0n;
+    try { baseBefore = await this.vault.getVaultBalance(this.market.base); } catch { /* 0 */ }
+
     try {
       const res = await this.executor.executeOrder(this.market, {
         walletAddress: envConfig.walletAddress,
@@ -145,10 +149,16 @@ class Grid {
         selfMatchingOption: 'cancelTaker',
       });
 
-      const filled = Number(qtyStr);
-      this.lots.push({ price, qty: filled });
-      this.totalVolume += price * filled;
-      log(`[grid] ✓ BUY ${qtyStr} @ ${priceStr} (IOC)  lots=${this.lots.length}  pnl=$${this.realizedPnl.toFixed(4)}  vol=$${this.totalVolume.toFixed(2)}  tx=${res.txHash}`);
+      const baseAfter = await this.vault.getVaultBalance(this.market.base);
+      const delta     = baseAfter - baseBefore;
+      const filled    = delta > 0n ? Number(formatUnits(delta, this.market.baseDecimals)) : 0;
+      if (filled > 0) {
+        this.lots.push({ price, qty: filled });
+        this.totalVolume += price * filled;
+        log(`[grid] ✓ BUY ${filled.toFixed(6)} @ ${priceStr} (IOC)  lots=${this.lots.length}  pnl=$${this.realizedPnl.toFixed(4)}  vol=$${this.totalVolume.toFixed(2)}  tx=${res.txHash}`);
+      } else {
+        log(`[grid] ✗ BUY no fill @ ${priceStr} (IOC cancelled)  tx=${res.txHash}`);
+      }
     } catch (err) {
       logErr(`[grid] BUY failed @ ${priceStr}`, err);
     }
@@ -158,6 +168,9 @@ class Grid {
     const priceStr = alignToStep(bestBid.toFixed(8), this.market.tickSize);
     const qtyStr   = alignToStep(qty.toFixed(8),     this.market.lotSize);
     if (Number(qtyStr) < Number(this.market.minQuantity)) { this.lots = []; return; }
+
+    let baseBefore = 0n;
+    try { baseBefore = await this.vault.getVaultBalance(this.market.base); } catch { /* 0 */ }
 
     try {
       const res = await this.executor.executeOrder(this.market, {
@@ -171,14 +184,20 @@ class Grid {
         selfMatchingOption: 'cancelTaker',
       });
 
-      const sold = Number(qtyStr);
-      this.closeLots(sold, bestBid);
-      this.trips++;
-      this.totalVolume += bestBid * sold;
-      log(`[grid] ✓ SELL ${qtyStr} @ ${priceStr} (IOC)  trips=${this.trips}  pnl=$${this.realizedPnl.toFixed(4)}  vol=$${this.totalVolume.toFixed(2)}  tx=${res.txHash}`);
+      const baseAfter = await this.vault.getVaultBalance(this.market.base);
+      const delta     = baseBefore - baseAfter;
+      const sold      = delta > 0n ? Number(formatUnits(delta, this.market.baseDecimals)) : 0;
+      if (sold > 0) {
+        this.closeLots(sold, bestBid);
+        this.trips++;
+        this.totalVolume += bestBid * sold;
+        log(`[grid] ✓ SELL ${sold.toFixed(6)} @ ${priceStr} (IOC)  trips=${this.trips}  pnl=$${this.realizedPnl.toFixed(4)}  vol=$${this.totalVolume.toFixed(2)}  tx=${res.txHash}`);
+      } else {
+        log(`[grid] ✗ SELL no fill @ ${priceStr} (IOC cancelled)  tx=${res.txHash}`);
+        this.lots = [];
+      }
     } catch (err) {
       logErr(`[grid] SELL failed @ ${priceStr}`, err);
-      // Revert means no base in vault — phantom lots, clear them.
       this.lots = [];
     }
   }
@@ -224,7 +243,8 @@ async function main(): Promise<void> {
   log(`[grid] StuckAt : ${STUCK_MS / 60_000}min`);
   log(`[grid] Poll    : ${POLL_MS}ms`);
 
-  const grid = new Grid(market, executor, http);
+  const vault = new VaultManager(signer, market.contract);
+  const grid  = new Grid(market, executor, http, vault);
 
   log('[grid] Starting tick loop...');
   while (running) {

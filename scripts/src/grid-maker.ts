@@ -128,10 +128,7 @@ class Grid {
   }
 
   private async buy(triggerPrice: number, bestAsk: number, qty: number): Promise<void> {
-    // IOC when there's an ask to take; PostOnly to rest as maker when book is thin.
-    const hasAsk   = Number.isFinite(bestAsk);
-    const price    = hasAsk ? bestAsk    : triggerPrice;
-    const otype    = hasAsk ? 'immediateOrCancel' as const : 'postOnly' as const;
+    const price    = Number.isFinite(bestAsk) ? bestAsk : triggerPrice;
     const priceStr = alignToStep(price.toFixed(8), this.market.tickSize);
     const qtyStr   = alignToStep(qty.toFixed(8),   this.market.lotSize);
     if (Number(qtyStr) < Number(this.market.minQuantity)) return;
@@ -144,14 +141,14 @@ class Grid {
         amount: qtyStr,
         price: priceStr,
         fundingSource: 'vault',
-        orderType: otype,
+        orderType: 'immediateOrCancel',
         selfMatchingOption: 'cancelTaker',
       });
 
       const filled = Number(qtyStr);
       this.lots.push({ price, qty: filled });
       this.totalVolume += price * filled;
-      log(`[grid] ✓ BUY ${qtyStr} @ ${priceStr} (${otype})  lots=${this.lots.length}  pnl=$${this.realizedPnl.toFixed(4)}  vol=$${this.totalVolume.toFixed(2)}  tx=${res.txHash}`);
+      log(`[grid] ✓ BUY ${qtyStr} @ ${priceStr} (IOC)  lots=${this.lots.length}  pnl=$${this.realizedPnl.toFixed(4)}  vol=$${this.totalVolume.toFixed(2)}  tx=${res.txHash}`);
     } catch (err) {
       logErr(`[grid] BUY failed @ ${priceStr}`, err);
     }

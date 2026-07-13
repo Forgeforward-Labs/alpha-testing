@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { Wallet, formatUnits } from 'ethers';
+import { Wallet, formatUnits, MaxUint256 } from 'ethers';
 import { config as envConfig } from './config.js';
 import {
   DreamDexHttpClient,
@@ -36,8 +36,9 @@ function logErr(msg: string, err?: unknown): void {
 interface Lot { price: number; qty: number; }
 
 // ── Grid ──────────────────────────────────────────────────────────────────────
-// Buy: vault USDso → placeOrder IOC → filled WETH lands in wallet.
-// Sell: deposit wallet WETH to vault first, then placeOrder IOC sell from vault.
+// placeOrder uses auto-pull by default: pulls input from wallet, delivers fill
+// to wallet. No vault deposits needed during trading — just ERC-20 approvals
+// set once at startup.
 
 class Grid {
   private lots: Lot[] = [];
@@ -52,7 +53,6 @@ class Grid {
     private readonly market: MarketInfo,
     private readonly executor: ContractOrderExecutor,
     private readonly http: DreamDexHttpClient,
-    private readonly vault: VaultManager,
     private readonly signer: TransactionExecutor,
   ) {}
 
@@ -126,15 +126,15 @@ class Grid {
     const qtyStr   = alignToStep(qty.toFixed(8),   this.market.lotSize);
     if (Number(qtyStr) < Number(this.market.minQuantity)) return;
 
-    // Vault USDso pre-check.
+    // Wallet USDso pre-check — auto-pull draws from wallet.
     try {
-      const vq = Number(formatUnits(await this.vault.getVaultBalance(this.market.quote), this.market.quoteDecimals));
-      if (vq < LOT_USDSO) { log(`[grid] Vault $${vq.toFixed(2)} < $${LOT_USDSO} — skip buy`); return; }
+      const wq = Number(formatUnits(await this.signer.getErc20Balance(this.market.quote), this.market.quoteDecimals));
+      if (wq < LOT_USDSO) { log(`[grid] Wallet $${wq.toFixed(2)} < $${LOT_USDSO} — skip buy`); return; }
     } catch { /* proceed */ }
 
-    // Wallet WETH snapshot — fill credited to wallet after placeOrder IOC.
-    let walletBaseBefore = 0n;
-    try { walletBaseBefore = await this.signer.getErc20Balance(this.market.base); } catch { /* 0 */ }
+    // Snapshot wallet WETH — fill is auto-delivered to wallet.
+    let baseBefore = 0n;
+    try { baseBefore = await this.signer.getErc20Balance(this.market.base); } catch { /* 0 */ }
 
     try {
       const res = await this.executor.executeOrder(this.market, {
@@ -148,13 +148,14 @@ class Grid {
         selfMatchingOption: 'cancelTaker',
       });
 
-      const walletBaseAfter = await this.signer.getErc20Balance(this.market.base);
-      const delta  = walletBaseAfter - walletBaseBefore;
-      const filled = delta > 0n ? Number(formatUnits(delta, this.market.baseDecimals)) : 0;
+      const baseAfter = await this.signer.getErc20Balance(this.market.base);
+      const filled    = baseAfter > baseBefore
+        ? Number(formatUnits(baseAfter - baseBefore, this.market.baseDecimals))
+        : 0;
       if (filled > 0) {
         this.lots.push({ price, qty: filled });
         this.totalVolume += price * filled;
-        log(`[grid] ✓ BUY ${filled.toFixed(6)} @ ${priceStr} (IOC)  lots=${this.lots.length}  pnl=$${this.realizedPnl.toFixed(4)}  vol=$${this.totalVolume.toFixed(2)}  tx=${res.txHash}`);
+        log(`[grid] ✓ BUY ${filled.toFixed(6)} @ ${priceStr}  lots=${this.lots.length}  pnl=$${this.realizedPnl.toFixed(4)}  vol=$${this.totalVolume.toFixed(2)}  tx=${res.txHash}`);
       } else {
         log(`[grid] ✗ BUY no fill @ ${priceStr} (IOC cancelled)  tx=${res.txHash}`);
       }
@@ -168,24 +169,12 @@ class Grid {
     const qtyStr   = alignToStep(qty.toFixed(8),     this.market.lotSize);
     if (Number(qtyStr) < Number(this.market.minQuantity)) { this.lots = []; return; }
 
-    // Deposit wallet WETH to vault so placeOrder sell has collateral.
-    try {
-      const walletBase = await this.signer.getErc20Balance(this.market.base);
-      if (walletBase > 0n) {
-        log(`[grid] Depositing ${formatUnits(walletBase, this.market.baseDecimals)} WETH to vault for sell...`);
-        await this.vault.depositAll(this.market, '0.02');
-      }
-    } catch (err) {
-      logErr('[grid] WETH deposit failed', err);
-      return;
-    }
+    // Snapshot wallet WETH — auto-pull draws WETH from wallet.
+    let baseBefore = 0n;
+    try { baseBefore = await this.signer.getErc20Balance(this.market.base); } catch { /* 0 */ }
 
-    // Vault WETH snapshot — placeOrder sell debits from vault.
-    let vaultBaseBefore = 0n;
-    try { vaultBaseBefore = await this.vault.getVaultBalance(this.market.base); } catch { /* 0 */ }
-
-    if (vaultBaseBefore === 0n) {
-      log('[grid] Vault WETH still 0 after deposit — clearing phantom lots');
+    if (baseBefore === 0n) {
+      log('[grid] Wallet WETH = 0 — clearing phantom lots');
       this.lots = [];
       return;
     }
@@ -202,14 +191,15 @@ class Grid {
         selfMatchingOption: 'cancelTaker',
       });
 
-      const vaultBaseAfter = await this.vault.getVaultBalance(this.market.base);
-      const delta = vaultBaseBefore - vaultBaseAfter;
-      const sold  = delta > 0n ? Number(formatUnits(delta, this.market.baseDecimals)) : 0;
+      const baseAfter = await this.signer.getErc20Balance(this.market.base);
+      const sold      = baseBefore > baseAfter
+        ? Number(formatUnits(baseBefore - baseAfter, this.market.baseDecimals))
+        : 0;
       if (sold > 0) {
         this.closeLots(sold, bestBid);
         this.trips++;
         this.totalVolume += bestBid * sold;
-        log(`[grid] ✓ SELL ${sold.toFixed(6)} @ ${priceStr} (IOC)  trips=${this.trips}  pnl=$${this.realizedPnl.toFixed(4)}  vol=$${this.totalVolume.toFixed(2)}  tx=${res.txHash}`);
+        log(`[grid] ✓ SELL ${sold.toFixed(6)} @ ${priceStr}  trips=${this.trips}  pnl=$${this.realizedPnl.toFixed(4)}  vol=$${this.totalVolume.toFixed(2)}  tx=${res.txHash}`);
       } else {
         log(`[grid] ✗ SELL no fill @ ${priceStr} (IOC cancelled)  tx=${res.txHash}`);
         this.lots = [];
@@ -261,12 +251,17 @@ async function main(): Promise<void> {
   log(`[grid] StuckAt : ${STUCK_MS / 60_000}min`);
   log(`[grid] Poll    : ${POLL_MS}ms`);
 
+  // Drain any vault balance to wallet — placeOrder auto-pulls from wallet.
   const vault = new VaultManager(signer, market.contract);
+  await vault.withdrawAll(market);
 
-  // Deposit any wallet tokens to vault at startup so buys can start immediately.
-  await vault.depositAll(market, '0.02');
+  // Approve pool to pull both tokens from wallet (MaxUint256, one-time per token).
+  log('[grid] Ensuring token approvals...');
+  await signer.ensureErc20Allowance(market.quote, market.contract, MaxUint256);
+  await signer.ensureErc20Allowance(market.base,  market.contract, MaxUint256);
+  log('[grid] Approvals ready.');
 
-  const grid = new Grid(market, executor, http, vault, signer);
+  const grid = new Grid(market, executor, http, signer);
 
   log('[grid] Starting tick loop...');
   while (running) {

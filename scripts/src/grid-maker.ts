@@ -36,8 +36,8 @@ function logErr(msg: string, err?: unknown): void {
 interface Lot { price: number; qty: number; }
 
 // ── Grid ──────────────────────────────────────────────────────────────────────
-// Tick-based grid funded entirely from wallet (placeTakerOrderWithoutVault).
-// Fill detection uses wallet WETH balance delta — vault is not queried per tick.
+// Buy: vault USDso → placeOrder IOC → filled WETH lands in wallet.
+// Sell: deposit wallet WETH to vault first, then placeOrder IOC sell from vault.
 
 class Grid {
   private lots: Lot[] = [];
@@ -52,6 +52,7 @@ class Grid {
     private readonly market: MarketInfo,
     private readonly executor: ContractOrderExecutor,
     private readonly http: DreamDexHttpClient,
+    private readonly vault: VaultManager,
     private readonly signer: TransactionExecutor,
   ) {}
 
@@ -69,7 +70,6 @@ class Grid {
       log(`[grid] Anchor set: ${mid.toFixed(4)}`);
     }
 
-    // Spread gate — sit out on dislocated book.
     const spreadBps = ((bestAsk - bestBid) / bestBid) * 10_000;
     if (spreadBps > MAX_SPREAD_BPS) {
       log(`[grid] Spread ${spreadBps.toFixed(1)}bps > ${MAX_SPREAD_BPS}bps — sitting out`);
@@ -92,32 +92,25 @@ class Grid {
       );
     }
 
-    // ── SELL: oldest lot's target crossed by best bid ───────────────────────
+    // ── SELL ───────────────────────────────────────────────────────────────
     if (this.lots.length > 0 && bestBid >= sellTrigger) {
-      const toSell = Math.min(qty, this.baseHeld());
-      await this.sell(bestBid, toSell);
+      await this.sell(bestBid, Math.min(qty, this.baseHeld()));
       this.stuckSince = undefined;
       return;
     }
 
-    // ── BUY: price dipped through the buy trigger ───────────────────────────
-    if (
-      !offloadOnly &&
-      bestAsk <= buyTrigger &&
-      inventoryUsdso < MAX_INVENTORY &&
-      qty >= minQty
-    ) {
+    // ── BUY ────────────────────────────────────────────────────────────────
+    if (!offloadOnly && bestAsk <= buyTrigger && inventoryUsdso < MAX_INVENTORY && qty >= minQty) {
       await this.buy(buyTrigger, bestAsk, qty);
       return;
     }
 
-    // ── STUCK: holding lots but sell trigger not reached for too long ────────
+    // ── STUCK ──────────────────────────────────────────────────────────────
     if (this.lots.length > 0 && STUCK_MS > 0) {
       const now = Date.now();
       this.stuckSince ??= now;
       if (now - this.stuckSince >= STUCK_MS) {
-        const stuckMin = Math.round((now - this.stuckSince) / 60_000);
-        log(`[grid] Stuck ${stuckMin}m — cutting ${this.baseHeld().toFixed(6)} base at bid ${bestBid}`);
+        log(`[grid] Stuck ${Math.round((now - this.stuckSince) / 60_000)}m — cutting at bid ${bestBid}`);
         await this.sell(bestBid, this.baseHeld());
         this.anchor = mid;
         this.stuckSince = undefined;
@@ -133,21 +126,15 @@ class Grid {
     const qtyStr   = alignToStep(qty.toFixed(8),   this.market.lotSize);
     if (Number(qtyStr) < Number(this.market.minQuantity)) return;
 
-    // Pre-check wallet quote balance.
+    // Vault USDso pre-check.
     try {
-      const walletQuote = Number(formatUnits(
-        await this.signer.getErc20Balance(this.market.quote),
-        this.market.quoteDecimals,
-      ));
-      if (walletQuote < LOT_USDSO) {
-        log(`[grid] Wallet quote $${walletQuote.toFixed(2)} < $${LOT_USDSO} — skip buy`);
-        return;
-      }
+      const vq = Number(formatUnits(await this.vault.getVaultBalance(this.market.quote), this.market.quoteDecimals));
+      if (vq < LOT_USDSO) { log(`[grid] Vault $${vq.toFixed(2)} < $${LOT_USDSO} — skip buy`); return; }
     } catch { /* proceed */ }
 
-    // Snapshot wallet WETH before — delta after tx confirms actual fill.
-    let baseBefore = 0n;
-    try { baseBefore = await this.signer.getErc20Balance(this.market.base); } catch { /* 0 */ }
+    // Wallet WETH snapshot — fill credited to wallet after placeOrder IOC.
+    let walletBaseBefore = 0n;
+    try { walletBaseBefore = await this.signer.getErc20Balance(this.market.base); } catch { /* 0 */ }
 
     try {
       const res = await this.executor.executeOrder(this.market, {
@@ -156,14 +143,14 @@ class Grid {
         side: 'buy',
         amount: qtyStr,
         price: priceStr,
-        fundingSource: 'wallet',
+        fundingSource: 'vault',
         orderType: 'immediateOrCancel',
         selfMatchingOption: 'cancelTaker',
       });
 
-      const baseAfter = await this.signer.getErc20Balance(this.market.base);
-      const delta     = baseAfter - baseBefore;
-      const filled    = delta > 0n ? Number(formatUnits(delta, this.market.baseDecimals)) : 0;
+      const walletBaseAfter = await this.signer.getErc20Balance(this.market.base);
+      const delta  = walletBaseAfter - walletBaseBefore;
+      const filled = delta > 0n ? Number(formatUnits(delta, this.market.baseDecimals)) : 0;
       if (filled > 0) {
         this.lots.push({ price, qty: filled });
         this.totalVolume += price * filled;
@@ -181,9 +168,27 @@ class Grid {
     const qtyStr   = alignToStep(qty.toFixed(8),     this.market.lotSize);
     if (Number(qtyStr) < Number(this.market.minQuantity)) { this.lots = []; return; }
 
-    // Snapshot wallet WETH before — delta confirms actual amount sold.
-    let baseBefore = 0n;
-    try { baseBefore = await this.signer.getErc20Balance(this.market.base); } catch { /* 0 */ }
+    // Deposit wallet WETH to vault so placeOrder sell has collateral.
+    try {
+      const walletBase = await this.signer.getErc20Balance(this.market.base);
+      if (walletBase > 0n) {
+        log(`[grid] Depositing ${formatUnits(walletBase, this.market.baseDecimals)} WETH to vault for sell...`);
+        await this.vault.depositAll(this.market, '0.02');
+      }
+    } catch (err) {
+      logErr('[grid] WETH deposit failed', err);
+      return;
+    }
+
+    // Vault WETH snapshot — placeOrder sell debits from vault.
+    let vaultBaseBefore = 0n;
+    try { vaultBaseBefore = await this.vault.getVaultBalance(this.market.base); } catch { /* 0 */ }
+
+    if (vaultBaseBefore === 0n) {
+      log('[grid] Vault WETH still 0 after deposit — clearing phantom lots');
+      this.lots = [];
+      return;
+    }
 
     try {
       const res = await this.executor.executeOrder(this.market, {
@@ -192,14 +197,14 @@ class Grid {
         side: 'sell',
         amount: qtyStr,
         price: priceStr,
-        fundingSource: 'wallet',
+        fundingSource: 'vault',
         orderType: 'immediateOrCancel',
         selfMatchingOption: 'cancelTaker',
       });
 
-      const baseAfter = await this.signer.getErc20Balance(this.market.base);
-      const delta     = baseBefore - baseAfter;
-      const sold      = delta > 0n ? Number(formatUnits(delta, this.market.baseDecimals)) : 0;
+      const vaultBaseAfter = await this.vault.getVaultBalance(this.market.base);
+      const delta = vaultBaseBefore - vaultBaseAfter;
+      const sold  = delta > 0n ? Number(formatUnits(delta, this.market.baseDecimals)) : 0;
       if (sold > 0) {
         this.closeLots(sold, bestBid);
         this.trips++;
@@ -256,15 +261,12 @@ async function main(): Promise<void> {
   log(`[grid] StuckAt : ${STUCK_MS / 60_000}min`);
   log(`[grid] Poll    : ${POLL_MS}ms`);
 
-  // Move any vault USDso to wallet so wallet-funded buys have capital.
-  const vaultManager = new VaultManager(signer, market.contract);
-  const vaultQuote = await vaultManager.getVaultBalance(market.quote);
-  if (vaultQuote > 0n) {
-    log(`[grid] Withdrawing ${formatUnits(vaultQuote, market.quoteDecimals)} ${market.quote.slice(0, 6)} from vault to wallet...`);
-    await vaultManager.withdrawAll(market);
-  }
+  const vault = new VaultManager(signer, market.contract);
 
-  const grid = new Grid(market, executor, http, signer);
+  // Deposit any wallet tokens to vault at startup so buys can start immediately.
+  await vault.depositAll(market, '0.02');
+
+  const grid = new Grid(market, executor, http, vault, signer);
 
   log('[grid] Starting tick loop...');
   while (running) {

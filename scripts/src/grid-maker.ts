@@ -36,9 +36,8 @@ function logErr(msg: string, err?: unknown): void {
 interface Lot { price: number; qty: number; }
 
 // ── Grid ──────────────────────────────────────────────────────────────────────
-// Tick-based grid: buy on dip below anchor, sell on bounce above entry.
-// Both sides use IOC. Vault balance deltas confirm actual fills so phantom
-// lots from cancelled IOC orders never accumulate.
+// Tick-based grid funded entirely from wallet (placeTakerOrderWithoutVault).
+// Fill detection uses wallet WETH balance delta — vault is not queried per tick.
 
 class Grid {
   private lots: Lot[] = [];
@@ -53,7 +52,7 @@ class Grid {
     private readonly market: MarketInfo,
     private readonly executor: ContractOrderExecutor,
     private readonly http: DreamDexHttpClient,
-    private readonly vault: VaultManager,
+    private readonly signer: TransactionExecutor,
   ) {}
 
   async tick(): Promise<void> {
@@ -134,8 +133,9 @@ class Grid {
     const qtyStr   = alignToStep(qty.toFixed(8),   this.market.lotSize);
     if (Number(qtyStr) < Number(this.market.minQuantity)) return;
 
+    // Snapshot wallet WETH before — delta after tx confirms actual fill.
     let baseBefore = 0n;
-    try { baseBefore = await this.vault.getVaultBalance(this.market.base); } catch { /* 0 */ }
+    try { baseBefore = await this.signer.getErc20Balance(this.market.base); } catch { /* 0 */ }
 
     try {
       const res = await this.executor.executeOrder(this.market, {
@@ -144,12 +144,12 @@ class Grid {
         side: 'buy',
         amount: qtyStr,
         price: priceStr,
-        fundingSource: 'vault',
+        fundingSource: 'wallet',
         orderType: 'immediateOrCancel',
         selfMatchingOption: 'cancelTaker',
       });
 
-      const baseAfter = await this.vault.getVaultBalance(this.market.base);
+      const baseAfter = await this.signer.getErc20Balance(this.market.base);
       const delta     = baseAfter - baseBefore;
       const filled    = delta > 0n ? Number(formatUnits(delta, this.market.baseDecimals)) : 0;
       if (filled > 0) {
@@ -169,8 +169,9 @@ class Grid {
     const qtyStr   = alignToStep(qty.toFixed(8),     this.market.lotSize);
     if (Number(qtyStr) < Number(this.market.minQuantity)) { this.lots = []; return; }
 
+    // Snapshot wallet WETH before — delta confirms actual amount sold.
     let baseBefore = 0n;
-    try { baseBefore = await this.vault.getVaultBalance(this.market.base); } catch { /* 0 */ }
+    try { baseBefore = await this.signer.getErc20Balance(this.market.base); } catch { /* 0 */ }
 
     try {
       const res = await this.executor.executeOrder(this.market, {
@@ -179,12 +180,12 @@ class Grid {
         side: 'sell',
         amount: qtyStr,
         price: priceStr,
-        fundingSource: 'vault',
+        fundingSource: 'wallet',
         orderType: 'immediateOrCancel',
         selfMatchingOption: 'cancelTaker',
       });
 
-      const baseAfter = await this.vault.getVaultBalance(this.market.base);
+      const baseAfter = await this.signer.getErc20Balance(this.market.base);
       const delta     = baseBefore - baseAfter;
       const sold      = delta > 0n ? Number(formatUnits(delta, this.market.baseDecimals)) : 0;
       if (sold > 0) {
@@ -243,8 +244,15 @@ async function main(): Promise<void> {
   log(`[grid] StuckAt : ${STUCK_MS / 60_000}min`);
   log(`[grid] Poll    : ${POLL_MS}ms`);
 
-  const vault = new VaultManager(signer, market.contract);
-  const grid  = new Grid(market, executor, http, vault);
+  // Move any vault USDso to wallet so wallet-funded buys have capital.
+  const vaultManager = new VaultManager(signer, market.contract);
+  const vaultQuote = await vaultManager.getVaultBalance(market.quote);
+  if (vaultQuote > 0n) {
+    log(`[grid] Withdrawing ${formatUnits(vaultQuote, market.quoteDecimals)} ${market.quote.slice(0, 6)} from vault to wallet...`);
+    await vaultManager.withdrawAll(market);
+  }
+
+  const grid = new Grid(market, executor, http, signer);
 
   log('[grid] Starting tick loop...');
   while (running) {

@@ -232,13 +232,16 @@ class Grid {
     return this.lots.reduce((s, l) => s + l.qty, 0);
   }
 
-  async adoptWalletBase(mid: number): Promise<void> {
+  async adoptWalletBase(bestBid: number): Promise<void> {
     try {
       const bal = await this.signer.getErc20Balance(this.market.base);
       const qty = Number(formatUnits(bal, this.market.baseDecimals));
       if (qty >= Number(this.market.minQuantity)) {
-        this.lots.push({ price: mid, qty });
-        log(`[grid] Adopted ${qty.toFixed(6)} wallet ${this.market.symbol.split(':')[0]} as open lot @ $${mid.toFixed(4)}`);
+        // Price the lot just below bestBid so the sell trigger fires immediately
+        // on the first tick — avoids holding unknown-cost WETH waiting for an uptick.
+        const adoptPrice = bestBid / (1 + STEP_BPS / 10_000);
+        this.lots.push({ price: adoptPrice, qty });
+        log(`[grid] Adopted ${qty.toFixed(6)} wallet ${this.market.symbol.split(':')[0]} @ trigger $${bestBid.toFixed(4)} (adoptPrice=${adoptPrice.toFixed(4)})`);
       }
     } catch { /* ignore */ }
   }
@@ -283,9 +286,8 @@ async function main(): Promise<void> {
   // Adopt any WETH already sitting in wallet (e.g. from a failed sell on previous run).
   const initBook = await http.getOrderBook(market.symbol, 1);
   const initBid  = initBook?.bids[0] ? Number(initBook.bids[0].price) : undefined;
-  const initAsk  = initBook?.asks[0] ? Number(initBook.asks[0].price) : undefined;
-  if (initBid && initAsk) {
-    await grid.adoptWalletBase((initBid + initAsk) / 2);
+  if (initBid) {
+    await grid.adoptWalletBase(initBid);
   }
 
   log('[grid] Starting tick loop...');

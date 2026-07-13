@@ -12,7 +12,7 @@ import { alignToStep } from '@trading/sdk';
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const STEP_BPS         = Number(process.env.GRID_STEP_BPS          ?? '10');
-const LOT_USDSO        = Number(process.env.GRID_SIZE_QUOTE        ?? '9');
+const LOT_USDSO        = Number(process.env.GRID_SIZE_QUOTE        ?? '6');
 const MAX_INVENTORY    = Number(process.env.GRID_MAX_INVENTORY     ?? '80');
 const MAX_SESSION_LOSS = Number(process.env.GRID_MAX_SESSION_LOSS  ?? '20');
 const MAX_SPREAD_BPS   = Number(process.env.GRID_MAX_SPREAD_BPS    ?? '100');
@@ -48,6 +48,7 @@ class Grid {
   private totalVolume = 0;
   private trips = 0;
   private tickCount = 0;
+  private lowQuoteWarned = false;
 
   constructor(
     private readonly market: MarketInfo,
@@ -127,7 +128,14 @@ class Grid {
     // Wallet USDso pre-check — auto-pull draws from wallet.
     try {
       const wq = Number(formatUnits(await this.signer.getErc20Balance(this.market.quote), this.market.quoteDecimals));
-      if (wq < LOT_USDSO) { log(`[grid] Wallet $${wq.toFixed(2)} < $${LOT_USDSO} — skip buy`); return; }
+      if (wq < LOT_USDSO) {
+        if (!this.lowQuoteWarned) {
+          log(`[grid] Wallet $${wq.toFixed(2)} < $${LOT_USDSO} — skip buy (suppressing further warnings)`);
+          this.lowQuoteWarned = true;
+        }
+        return;
+      }
+      this.lowQuoteWarned = false;
     } catch { /* proceed */ }
 
     // Snapshot wallet WETH — fill is auto-delivered to wallet.
@@ -223,6 +231,17 @@ class Grid {
   private baseHeld(): number {
     return this.lots.reduce((s, l) => s + l.qty, 0);
   }
+
+  async adoptWalletBase(mid: number): Promise<void> {
+    try {
+      const bal = await this.signer.getErc20Balance(this.market.base);
+      const qty = Number(formatUnits(bal, this.market.baseDecimals));
+      if (qty >= Number(this.market.minQuantity)) {
+        this.lots.push({ price: mid, qty });
+        log(`[grid] Adopted ${qty.toFixed(6)} wallet ${this.market.symbol.split(':')[0]} as open lot @ $${mid.toFixed(4)}`);
+      }
+    } catch { /* ignore */ }
+  }
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -260,6 +279,14 @@ async function main(): Promise<void> {
   log('[grid] Approvals ready.');
 
   const grid = new Grid(market, executor, http, signer);
+
+  // Adopt any WETH already sitting in wallet (e.g. from a failed sell on previous run).
+  const initBook = await http.getOrderBook(market.symbol, 1);
+  const initBid  = initBook?.bids[0] ? Number(initBook.bids[0].price) : undefined;
+  const initAsk  = initBook?.asks[0] ? Number(initBook.asks[0].price) : undefined;
+  if (initBid && initAsk) {
+    await grid.adoptWalletBase((initBid + initAsk) / 2);
+  }
 
   log('[grid] Starting tick loop...');
   while (running) {

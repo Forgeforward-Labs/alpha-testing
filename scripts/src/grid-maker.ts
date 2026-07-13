@@ -65,10 +65,11 @@ class Grid {
     if (bestBid === undefined || bestAsk === undefined) return;
 
     const mid = (bestBid + bestAsk) / 2;
-    if (this.anchor === undefined) {
+    // When flat, track current mid so buyTrigger always stays near market.
+    if (this.lots.length === 0) {
       this.anchor = mid;
-      log(`[grid] Anchor set: ${mid.toFixed(4)}`);
     }
+    this.anchor ??= mid;
 
     const spreadBps = ((bestAsk - bestBid) / bestBid) * 10_000;
     if (spreadBps > MAX_SPREAD_BPS) {
@@ -96,6 +97,7 @@ class Grid {
     if (this.lots.length > 0 && bestBid >= sellTrigger) {
       await this.sell(bestBid, Math.min(qty, this.baseHeld()));
       this.stuckSince = undefined;
+      this.anchor = mid; // re-anchor so next buy tracks current price
       return;
     }
 

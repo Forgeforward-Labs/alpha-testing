@@ -38,7 +38,7 @@ function sleep(ms: number): Promise<void> {
 }
 
 // Score a book: higher = better to trade on (tighter spread, more depth).
-function bookScore(book: OrderBook | null): number {
+function bookScore(book: OrderBook | null | undefined): number {
   if (!book?.bids[0] || !book?.asks[0]) return -Infinity;
   const bid = Number(book.bids[0].price);
   const ask = Number(book.asks[0].price);

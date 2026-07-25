@@ -14,14 +14,21 @@ const ERC20_ABI = [
 async function main(): Promise<void> {
   const to = process.env.TRANSFER_TO;
   if (!to) throw new Error('Set TRANSFER_TO=0x<address>');
-  if (!/^0x[0-9a-fA-F]{40}$/.test(to)) throw new Error(`Invalid address: ${to}`);
+  if (!/^0x[0-9a-fA-F]{40}$/.test(to))
+    throw new Error(`Invalid address: ${to}`);
 
   const provider = new JsonRpcProvider(config.rpcUrl);
-  const signer   = new Wallet(config.privateKey, provider);
+  const signer = new Wallet(config.privateKey, provider);
 
-  const http    = new DreamDexHttpClient(config.baseUrl, new Wallet(config.privateKey), config.chainId, config.siweDomain, config.siweUri);
+  const http = new DreamDexHttpClient(
+    config.baseUrl,
+    new Wallet(config.privateKey),
+    config.chainId,
+    config.siweDomain,
+    config.siweUri,
+  );
   const markets = await http.listMarkets();
-  const market  = markets.find(m => m.symbol === config.symbol);
+  const market = markets.find((m) => m.symbol === config.symbol);
   if (!market) throw new Error(`Market not found: ${config.symbol}`);
 
   const [baseName, quoteName] = market.symbol.split(':') as [string, string];
@@ -29,7 +36,15 @@ async function main(): Promise<void> {
 
   const tokens = [
     { name: quoteName, address: market.quote, decimals: market.quoteDecimals },
-    ...(!isNativeBase ? [{ name: baseName, address: market.base, decimals: market.baseDecimals }] : []),
+    ...(!isNativeBase
+      ? [
+          {
+            name: baseName,
+            address: market.base,
+            decimals: market.baseDecimals,
+          },
+        ]
+      : []),
   ];
 
   console.log(`From : ${signer.address}`);
@@ -37,9 +52,9 @@ async function main(): Promise<void> {
   console.log(`Market: ${market.symbol}\n`);
 
   for (const token of tokens) {
-    const erc20   = new Contract(token.address, ERC20_ABI, signer);
-    const balance = await erc20.balanceOf(signer.address) as bigint;
-    const human   = formatUnits(balance, token.decimals);
+    const erc20 = new Contract(token.address, ERC20_ABI, signer);
+    const balance = (await erc20.balanceOf(signer.address)) as bigint;
+    const human = formatUnits(balance, token.decimals);
 
     if (balance === 0n) {
       console.log(`${token.name.padEnd(8)}: 0 — skip`);
@@ -53,13 +68,15 @@ async function main(): Promise<void> {
   }
 
   if (isNativeBase) {
-    console.log('\nNote: SOMI is native gas — not transferred. Send manually if needed.');
+    console.log(
+      '\nNote: SOMI is native gas — not transferred. Send manually if needed.',
+    );
   }
 
   console.log('\nDone.');
 }
 
-main().catch(err => {
+main().catch((err) => {
   console.error(err instanceof Error ? err.message : err);
   process.exit(1);
 });

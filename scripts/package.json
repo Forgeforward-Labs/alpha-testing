@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/grid-maker.js",
+    "start": "node dist/scalper-batch.js",
     "dev": "tsx src/grid-maker.ts",
     "contract:buy": "tsx src/contract-order.ts buy",
     "contract:sell": "tsx src/contract-order.ts sell",
@@ -18,12 +18,17 @@
     "vault:withdraw": "tsx src/vault-withdraw.ts",
     "orders:cancel": "tsx src/cancel-orders.ts",
     "swing:maker": "tsx src/swing-maker.ts",
+    "scalper": "tsx src/scalper.ts",
+    "scalper:batch": "tsx src/scalper-batch.ts",
+    "transfer:out": "tsx src/transfer-out.ts",
+    "clear-delegate": "tsx src/clear-delegate.ts",
     "type-check": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
     "@trading/sdk": "workspace:*",
     "dotenv": "^16.4.5",
-    "ethers": "^6.13.2"
+    "ethers": "^6.13.2",
+    "viem": "^2.55.8"
   },
   "devDependencies": {
     "@types/node": "^22.10.1",

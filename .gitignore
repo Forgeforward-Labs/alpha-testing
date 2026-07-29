@@ -18,6 +18,10 @@ data/
 # turbo cache
 .turbo/
 
+# foundry
+out/
+cache/
+
 # editor
 .vscode/
 .idea/

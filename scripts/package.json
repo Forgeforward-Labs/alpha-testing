@@ -21,6 +21,7 @@
     "scalper": "tsx src/scalper.ts",
     "scalper:batch": "tsx src/scalper-batch.ts",
     "transfer:out": "tsx src/transfer-out.ts",
+    "buy:all": "tsx src/buy-all.ts",
     "clear-delegate": "tsx src/clear-delegate.ts",
     "type-check": "tsc -p tsconfig.json --noEmit"
   },
